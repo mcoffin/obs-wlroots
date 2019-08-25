@@ -6,6 +6,7 @@ pub mod sys {
 }
 
 pub mod source;
+pub mod data;
 
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub struct SemanticVersion(u32);

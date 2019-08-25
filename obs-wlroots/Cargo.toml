@@ -10,6 +10,11 @@ edition = "2018"
 crate-type = ["dylib"]
 
 [dependencies]
+wayland-client = "0.23"
+
+[dependencies.wayland-protocols]
+version = "0.23"
+features = ["client", "unstable_protocols"]
 
 [dependencies.obs]
 path = "../obs"

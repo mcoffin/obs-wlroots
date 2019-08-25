@@ -2,6 +2,10 @@ use ::obs_sys as sys;
 use std::mem;
 use std::ptr;
 
+pub unsafe fn register_source(info: &'static sys::obs_source_info) {
+    obs_register_source(info as *const sys::obs_source_info)
+}
+
 pub unsafe fn obs_register_source(info: *const sys::obs_source_info) {
     sys::obs_register_source_s(info, mem::size_of::<sys::obs_source_info>());
 }
