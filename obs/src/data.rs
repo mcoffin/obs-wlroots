@@ -5,7 +5,11 @@ use std::ffi;
 use std::mem;
 
 pub trait ObsData {
+    fn get_int<S: AsRef<str>>(&self, key: S) -> i64;
     fn get_string<S: AsRef<str>>(&self, key: S) -> Option<&ffi::CStr>;
+    fn get_double<S: AsRef<str>>(&self, key: S) -> f64;
+    fn get_bool<S: AsRef<str>>(&self, key: S) -> bool;
+    fn clear(&mut self);
 
     fn get_str<S: AsRef<str>>(&self, key: S) -> Option<Cow<str>> {
         self.get_string(key).map(|s| s.to_string_lossy())
@@ -13,6 +17,14 @@ pub trait ObsData {
 }
 
 impl ObsData for sys::obs_data_t {
+    fn get_int<S: AsRef<str>>(&self, key: S) -> i64 {
+        let key: &str = key.as_ref();
+        let c_key = ffi::CString::new(key)
+            .expect("Invalid utf8 key");
+        unsafe {
+            sys::obs_data_get_int(mem::transmute(self as *const sys::obs_data_t), mem::transmute(c_key.as_bytes_with_nul().as_ptr()))
+        }
+    }
     fn get_string<S: AsRef<str>>(&self, key: S) -> Option<&ffi::CStr> {
         let key: &str = key.as_ref();
         let c_key = ffi::CString::new(key)
@@ -26,5 +38,33 @@ impl ObsData for sys::obs_data_t {
             Some(ptr)
         };
         ret.map(|ptr| unsafe { ffi::CStr::from_ptr(ptr) })
+    }
+    fn get_double<S: AsRef<str>>(&self, key: S) -> f64 {
+        let key: &str = key.as_ref();
+        let c_key = ffi::CString::new(key)
+            .expect("Invalid utf8 key");
+        unsafe {
+            sys::obs_data_get_double(
+                mem::transmute(self as *const sys::obs_data_t),
+                mem::transmute(c_key.as_bytes_with_nul().as_ptr())
+            )
+        }
+    }
+    fn get_bool<S: AsRef<str>>(&self, key: S) -> bool {
+        let key: &str = key.as_ref();
+        let c_key = ffi::CString::new(key)
+            .expect("Invalid utf8 key");
+        unsafe {
+            sys::obs_data_get_bool(
+                mem::transmute(self as *const sys::obs_data_t),
+                mem::transmute(c_key.as_bytes_with_nul().as_ptr())
+            )
+        }
+    }
+
+    fn clear(&mut self) {
+        unsafe {
+            sys::obs_data_clear(self as *mut sys::obs_data);
+        }
     }
 }

@@ -64,7 +64,7 @@ impl WlrSource {
             self.xdg_outputs.push_back(xdg_output);
         }
         self.display_events.sync_roundtrip()
-            .expect("Error waiting on display events: {}");
+            .expect("Error waiting on display events");
     }
 
     pub fn get_current_output(&self) -> Option<wl_output::WlOutput> {
@@ -165,7 +165,8 @@ impl obs::source::Source for WlrSource {
         let outputs = self.outputs.read().unwrap();
         let output_metadata = self.output_metadata.read().unwrap();
 
-        self.current_output = output_metadata.iter().find(|&(_id, meta)| meta.name == settings.get_str("output").unwrap_or(Cow::Borrowed(meta.name.as_ref())))
+        self.current_output = output_metadata.iter()
+            .find(|&(_id, meta)| meta.name == settings.get_str("output").unwrap_or(Cow::Borrowed(meta.name.as_ref())))
             .map(|(&id, _meta)| id);
     }
 }
