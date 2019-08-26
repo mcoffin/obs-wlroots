@@ -1,12 +1,9 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, LinkedList};
-use std::ffi;
-use std::mem;
 use std::sync::{Arc, RwLock};
 use ::obs::sys as obs_sys;
 use wayland_client::protocol::wl_output;
 use wayland_client::protocol::wl_shm;
-use wayland_client::protocol::wl_registry;
 use wayland_protocols::unstable::xdg_output::v1::client::zxdg_output_manager_v1;
 use wayland_protocols::unstable::xdg_output::v1::client::zxdg_output_v1;
 use wayland_protocols::wlr::unstable::screencopy::v1::client::zwlr_screencopy_manager_v1;
@@ -48,7 +45,7 @@ impl WlrSource {
             let output_metadata = self.output_metadata.clone();
             let xdg_output = self.output_manager.get_xdg_output(output, move |output: NewProxy<_>| {
                 let output_metadata = output_metadata.clone();
-                output.implement_closure(move |event, proxy| {
+                output.implement_closure(move |event, _proxy| {
                     let output_metadata = output_metadata.clone();
                     let mut output_metadata = output_metadata.write().unwrap();
                     match event {
@@ -162,7 +159,6 @@ impl obs::source::Source for WlrSource {
     fn update(&mut self, settings: &mut obs_sys::obs_data_t) {
         use obs::data::ObsData;
 
-        let outputs = self.outputs.read().unwrap();
         let output_metadata = self.output_metadata.read().unwrap();
 
         self.current_output = output_metadata.iter()

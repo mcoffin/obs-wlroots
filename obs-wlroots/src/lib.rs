@@ -1,16 +1,13 @@
 extern crate obs;
-#[macro_use] extern crate wayland_client;
+extern crate wayland_client;
 
 pub use obs::sys as obs_sys;
 
-use std::ffi;
 use std::ptr;
 
 static mut MODULE_PTR: *mut obs_sys::obs_module = ptr::null_mut();
 
 static mut SOURCE_INFO: Option<obs::source::SourceInfo> = None;
-
-const SOURCE_INFO_NAME: &'static [u8] = b"obs_wlroots\0";
 
 pub mod source;
 
