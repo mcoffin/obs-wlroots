@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, LinkedList};
 use std::ffi;
 use std::mem;
@@ -10,6 +11,7 @@ use wayland_protocols::unstable::xdg_output::v1::client::zxdg_output_manager_v1;
 use wayland_protocols::unstable::xdg_output::v1::client::zxdg_output_v1;
 use wayland_protocols::wlr::unstable::screencopy::v1::client::zwlr_screencopy_manager_v1;
 
+const SOURCE_INFO_ID: &'static [u8] = b"obs_wlroots\0";
 const SOURCE_NAME: &'static [u8] = b"wlroots output\0";
 
 struct OutputMetadata {
@@ -37,7 +39,47 @@ pub struct WlrSource {
 }
 
 impl WlrSource {
-    fn new(settings: &mut obs_sys::obs_data_t, _source: &mut obs_sys::obs_source_t) -> Result<WlrSource, String> {
+    fn update_xdg_outputs(&mut self) {
+        use wayland_client::NewProxy;
+
+        let outputs = self.outputs.read().unwrap();
+        self.xdg_outputs = LinkedList::new();
+        for (&id, output) in outputs.iter() {
+            let output_metadata = self.output_metadata.clone();
+            let xdg_output = self.output_manager.get_xdg_output(output, move |output: NewProxy<_>| {
+                let output_metadata = output_metadata.clone();
+                output.implement_closure(move |event, proxy| {
+                    let output_metadata = output_metadata.clone();
+                    let mut output_metadata = output_metadata.write().unwrap();
+                    match event {
+                        zxdg_output_v1::Event::Name { name } => {
+                            output_metadata.insert(id, OutputMetadata {
+                                name: name,
+                            });
+                        },
+                        _ => {},
+                    }
+                }, ())
+            }).expect("Error creating xdg output interface");
+            self.xdg_outputs.push_back(xdg_output);
+        }
+        self.display_events.sync_roundtrip()
+            .expect("Error waiting on display events: {}");
+    }
+
+    pub fn get_current_output(&self) -> Option<wl_output::WlOutput> {
+        let outputs = self.outputs.read().unwrap();
+        self.current_output
+            .as_ref()
+            .and_then(|id| outputs.get(id))
+            .map(Clone::clone)
+    }
+}
+
+impl obs::source::Source for WlrSource {
+    const ID: &'static [u8] = SOURCE_INFO_ID;
+    const NAME: &'static [u8] = SOURCE_NAME;
+    fn create(settings: &mut obs_sys::obs_data_t, _source: &mut obs_sys::obs_source_t) -> Result<WlrSource, String> {
         use obs::data::ObsData;
         use wayland_client::{Display, GlobalManager};
 
@@ -77,13 +119,6 @@ impl WlrSource {
         let _status = display_events.sync_roundtrip()
             .map_err(|e| format!("Error waiting on display events: {}", e))?;
 
-        {
-            let outputs = outputs_clone.read().unwrap();
-            for (id, output) in outputs.iter() {
-
-            }
-        }
-
         let shm = global_manager.instantiate_exact::<wl_shm::WlShm, _>(1, |shm| shm.implement_dummy())
             .map_err(|e| format!("Error creating shm interface: {}", e))?;
         let output_manager = global_manager.instantiate_exact::<zxdg_output_manager_v1::ZxdgOutputManagerV1, _>(2, |mgr| mgr.implement_dummy())
@@ -115,78 +150,34 @@ impl WlrSource {
                 println!("output {}: {}", id, &metadata.name);
             }
         }
+        let current_output_id = {
+            let outputs = ret.outputs.read().unwrap();
+            outputs.keys().next().map(|&id| id)
+        };
+        ret.current_output = current_output_id;
 
         Ok(ret)
     }
 
-    fn update_xdg_outputs(&mut self) {
-        use wayland_client::NewProxy;
+    fn update(&mut self, settings: &mut obs_sys::obs_data_t) {
+        use obs::data::ObsData;
 
         let outputs = self.outputs.read().unwrap();
-        self.xdg_outputs = LinkedList::new();
-        for (&id, output) in outputs.iter() {
-            let output_metadata = self.output_metadata.clone();
-            let xdg_output = self.output_manager.get_xdg_output(output, move |output: NewProxy<_>| {
-                let output_metadata = output_metadata.clone();
-                output.implement_closure(move |event, proxy| {
-                    let output_metadata = output_metadata.clone();
-                    let mut output_metadata = output_metadata.write().unwrap();
-                    match event {
-                        zxdg_output_v1::Event::Name { name } => {
-                            output_metadata.insert(id, OutputMetadata {
-                                name: name,
-                            });
-                        },
-                        _ => {},
-                    }
-                }, ())
-            }).expect("Error creating xdg output interface");
-            self.xdg_outputs.push_back(xdg_output);
-        }
-        self.display_events.sync_roundtrip()
-            .expect("Error waiting on display events: {}");
-    }
+        let output_metadata = self.output_metadata.read().unwrap();
 
-    pub fn get_current_output(&self) -> Option<wl_output::WlOutput> {
-        let outputs = self.outputs.read().unwrap();
-        self.current_output
-            .as_ref()
-            .and_then(|id| outputs.get(id))
-            .map(Clone::clone)
+        self.current_output = output_metadata.iter().find(|&(_id, meta)| meta.name == settings.get_str("output").unwrap_or(Cow::Borrowed(meta.name.as_ref())))
+            .map(|(&id, _meta)| id);
     }
+}
 
-    pub fn width(&self) -> u32 {
+impl obs::source::VideoSource for WlrSource {
+    fn width(&self) -> u32 {
         // TODO: implement
         0
     }
 
-    pub fn height(&self) -> u32 {
+    fn height(&self) -> u32 {
         // TODO: implement
         0
     }
-}
-
-pub unsafe extern "C" fn get_name(_data: *mut ffi::c_void) -> *const i8 {
-    ffi::CStr::from_bytes_with_nul_unchecked(SOURCE_NAME).as_ptr()
-}
-
-pub unsafe extern "C" fn create(settings: *mut obs_sys::obs_data_t, source: *mut obs_sys::obs_source_t) -> *mut ffi::c_void {
-    let wlr_source = WlrSource::new(settings.as_mut().unwrap(), source.as_mut().unwrap())
-        .expect("Error creating wlroots source");
-    let ret = Box::new(wlr_source);
-    mem::transmute(Box::into_raw(ret))
-}
-
-pub unsafe extern "C" fn destroy(data: *mut ffi::c_void) {
-    let _b: Box<WlrSource> = Box::from_raw(mem::transmute(data));
-}
-
-pub unsafe extern "C" fn get_width(data: *mut ffi::c_void) -> u32 {
-    let data: &mut WlrSource = mem::transmute(data);
-    data.width()
-}
-
-pub unsafe extern "C" fn get_height(data: *mut ffi::c_void) -> u32 {
-    let data: &mut WlrSource = mem::transmute(data);
-    data.height()
 }
