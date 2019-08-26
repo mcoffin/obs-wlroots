@@ -11,6 +11,7 @@ fn main() {
     let bindings = bindgen::builder()
         .header("wrapper.h")
         .blacklist_type("_bindgen_ty_2")
+        .rustified_enum("obs_combo_format")
         .generate()
         .expect("Error generating libobs bindings");
 

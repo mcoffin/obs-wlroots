@@ -5,8 +5,11 @@ pub mod sys {
     pub use obs_sys::*;
 }
 
-pub mod source;
 pub mod data;
+pub mod properties;
+pub mod source;
+
+pub use properties::Properties;
 
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub struct SemanticVersion(u32);

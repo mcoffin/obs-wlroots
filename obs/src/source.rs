@@ -1,4 +1,5 @@
 use ::obs_sys as sys;
+use crate::properties;
 use std::ffi;
 use std::mem;
 use std::ptr;
@@ -53,11 +54,16 @@ pub fn empty_source() -> sys::obs_source_info {
 }
 
 pub trait Source: 'static + Sized {
+    /// Unique identifier string, *must* include null-terminator
     const ID: &'static [u8];
+    /// Source name, *must* include null-terminator
     const NAME: &'static [u8];
     fn create(settings: &mut sys::obs_data_t, source: &mut sys::obs_source_t) -> Result<Self, String>;
 
     fn update(&mut self, _settings: &mut sys::obs_data_t) {}
+    fn get_properties(&mut self) -> properties::Properties {
+        properties::Properties::new()
+    }
 }
 
 unsafe extern "C" fn get_name<S: Source>(_data: *mut ffi::c_void) -> *const i8 {
@@ -82,6 +88,12 @@ unsafe extern "C" fn update<S: Source>(data: *mut ffi::c_void, settings: *mut sy
     let data: &mut S = data.as_mut().unwrap();
     let settings: &mut sys::obs_data_t = settings.as_mut().unwrap();
     data.update(settings);
+}
+
+unsafe extern "C" fn get_properties<S: Source>(data: *mut ffi::c_void) -> *mut sys::obs_properties_t {
+    let data: *mut S = mem::transmute(data);
+    let data: &mut S = data.as_mut().unwrap();
+    data.get_properties().into_raw()
 }
 
 pub trait VideoSource: Source {
@@ -119,5 +131,6 @@ pub fn video_source_info<S: VideoSource>() -> SourceInfo {
     info.get_width = Some(video_get_width::<S>);
     info.get_height = Some(video_get_height::<S>);
     info.update = Some(update::<S>);
+    info.get_properties = Some(get_properties::<S>);
     SourceInfo(info)
 }

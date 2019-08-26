@@ -147,11 +147,7 @@ impl obs::source::Source for WlrSource {
                 println!("output {}: {}", id, &metadata.name);
             }
         }
-        let current_output_id = {
-            let outputs = ret.outputs.read().unwrap();
-            outputs.keys().next().map(|&id| id)
-        };
-        ret.current_output = current_output_id;
+        ret.update(settings);
 
         Ok(ret)
     }
@@ -159,11 +155,27 @@ impl obs::source::Source for WlrSource {
     fn update(&mut self, settings: &mut obs_sys::obs_data_t) {
         use obs::data::ObsData;
 
+        println!("obs_wlroots: update(output = {:?})", settings.get_string("output"));
+
         let output_metadata = self.output_metadata.read().unwrap();
 
         self.current_output = output_metadata.iter()
             .find(|&(_id, meta)| meta.name == settings.get_str("output").unwrap_or(Cow::Borrowed(meta.name.as_ref())))
             .map(|(&id, _meta)| id);
+    }
+
+    fn get_properties(&mut self) -> obs::Properties {
+        use obs::Properties;
+        use obs::properties::PropertyList;
+
+        let mut props = obs::Properties::new();
+        let mut output_list = props.add_string_list("output", "Output");
+
+        let output_metadata = self.output_metadata.read().unwrap();
+        for (&id, ref metadata) in output_metadata.iter() {
+            output_list.add_item(&metadata.name, &metadata.name);
+        }
+        props
     }
 }
 
