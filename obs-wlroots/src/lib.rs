@@ -1,3 +1,4 @@
+extern crate libc;
 extern crate obs;
 extern crate wayland_client;
 
@@ -10,6 +11,7 @@ static mut MODULE_PTR: *mut obs_sys::obs_module = ptr::null_mut();
 static mut SOURCE_INFO: Option<obs::source::SourceInfo> = None;
 
 pub mod source;
+pub(crate) mod shm;
 
 #[no_mangle]
 pub extern "C" fn obs_module_load() -> bool {

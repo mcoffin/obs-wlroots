@@ -99,6 +99,7 @@ unsafe extern "C" fn get_properties<S: Source>(data: *mut ffi::c_void) -> *mut s
 pub trait VideoSource: Source {
     fn width(&self) -> u32;
     fn height(&self) -> u32;
+    fn render(&mut self);
 }
 
 unsafe extern "C" fn video_get_width<S: VideoSource>(data: *mut ffi::c_void) -> u32 {
@@ -109,6 +110,11 @@ unsafe extern "C" fn video_get_width<S: VideoSource>(data: *mut ffi::c_void) -> 
 unsafe extern "C" fn video_get_height<S: VideoSource>(data: *mut ffi::c_void) -> u32 {
     let data: &mut S = mem::transmute(data);
     data.height()
+}
+
+unsafe extern "C" fn video_render<S: VideoSource>(data: *mut ffi::c_void, _effect: *mut sys::gs_effect_t) {
+    let data: &mut S = mem::transmute(data);
+    data.render()
 }
 
 pub struct SourceInfo(sys::obs_source_info);
@@ -132,5 +138,6 @@ pub fn video_source_info<S: VideoSource>() -> SourceInfo {
     info.get_height = Some(video_get_height::<S>);
     info.update = Some(update::<S>);
     info.get_properties = Some(get_properties::<S>);
+    info.video_render = Some(video_render::<S>);
     SourceInfo(info)
 }

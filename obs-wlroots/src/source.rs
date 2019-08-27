@@ -1,12 +1,15 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, LinkedList};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, Mutex};
 use ::obs::sys as obs_sys;
+use crate::shm;
 use wayland_client::protocol::wl_output;
 use wayland_client::protocol::wl_shm;
+use wayland_client::protocol::wl_shm_pool;
 use wayland_protocols::unstable::xdg_output::v1::client::zxdg_output_manager_v1;
 use wayland_protocols::unstable::xdg_output::v1::client::zxdg_output_v1;
 use wayland_protocols::wlr::unstable::screencopy::v1::client::zwlr_screencopy_manager_v1;
+use wayland_protocols::wlr::unstable::screencopy::v1::client::zwlr_screencopy_frame_v1::{self, ZwlrScreencopyFrameV1};
 
 const SOURCE_INFO_ID: &'static [u8] = b"obs_wlroots\0";
 const SOURCE_NAME: &'static [u8] = b"wlroots output\0";
@@ -23,6 +26,145 @@ impl OutputMetadata {
     }
 }
 
+struct WlrFrame {
+    waiting: bool,
+    fd: Option<libc::c_int>,
+    shm: wl_shm::WlShm,
+    pool: Option<wl_shm_pool::WlShmPool>,
+    buffer: Option<wayland_client::protocol::wl_buffer::WlBuffer>,
+    format: u32,
+    width: u32,
+    height: u32,
+    stride: u32,
+}
+
+impl WlrFrame {
+    fn new(shm: wl_shm::WlShm) -> WlrFrame {
+        WlrFrame {
+            waiting: true,
+            fd: None,
+            shm: shm,
+            pool: None,
+            buffer: None,
+            format: 0,
+            width: 0,
+            height: 0,
+            stride: 0
+        }
+    }
+
+    fn size(&self) -> usize {
+        (self.height as usize) * (self.stride as usize)
+    }
+
+    #[inline(always)]
+    fn buffer_format(&self) -> Option<wl_shm::Format> {
+        wl_shm::Format::from_raw(self.format)
+    }
+}
+
+impl Drop for WlrFrame {
+    fn drop(&mut self) {
+        println!("obs_wlroots: WlrFrame::drop");
+        if let Some(fd) = self.fd {
+            unsafe {
+                libc::close(fd);
+            }
+        }
+    }
+}
+
+impl zwlr_screencopy_frame_v1::EventHandler for WlrFrame {
+    fn buffer(
+        &mut self,
+        object: ZwlrScreencopyFrameV1,
+        format: u32,
+        width: u32,
+        height: u32,
+        stride: u32
+    ) {
+        use wayland_client::NewProxy;
+
+        self.format = format;
+        self.width = width;
+        self.height = height;
+        self.stride = stride;
+        unsafe {
+            self.fd = Some(shm::open("/obs_wlroots", libc::O_CREAT | libc::O_RDWR, 0));
+            shm::unlink("/obs_wlroots");
+            libc::ftruncate(self.fd.unwrap(), self.size() as libc::off_t);
+        }
+        self.pool = Some(self.shm.create_pool(self.fd.unwrap(), self.size() as i32, |p: NewProxy<_>| p.implement_dummy()).unwrap());
+        self.buffer = Some(self.pool.as_ref().unwrap().create_buffer(0, self.width as i32, self.height as i32, self.stride as i32, self.buffer_format().unwrap(), |b: NewProxy<_>| b.implement_dummy()).unwrap());
+        object.copy(self.buffer.as_ref().unwrap());
+    }
+
+    fn ready(
+        &mut self,
+        object: ZwlrScreencopyFrameV1,
+        tv_sec_hi: u32,
+        tv_sec_lo: u32,
+        tv_nsec: u32
+    ) {
+        // TODO
+        object.destroy();
+    }
+
+    fn failed(
+        &mut self,
+        object: ZwlrScreencopyFrameV1
+    ) {
+        object.destroy();
+    }
+}
+
+struct Container<T>(Arc<Mutex<T>>);
+
+impl<T> Clone for Container<T> {
+    fn clone(&self) -> Self {
+        Container(self.0.clone())
+    }
+}
+
+impl<T: Sized> Container<T> {
+    fn new(value: T) -> Container<T> {
+        Container(Arc::new(Mutex::new(value)))
+    }
+}
+
+impl<T: zwlr_screencopy_frame_v1::EventHandler> zwlr_screencopy_frame_v1::EventHandler for Container<T> {
+    fn buffer(
+        &mut self,
+        object: ZwlrScreencopyFrameV1,
+        format: u32,
+        width: u32,
+        height: u32,
+        stride: u32
+    ) {
+        let mut content = self.0.lock().unwrap();
+        content.buffer(object, format, width, height, stride);
+    }
+
+    fn ready(
+        &mut self,
+        object: ZwlrScreencopyFrameV1,
+        tv_sec_hi: u32,
+        tv_sec_lo: u32,
+        tv_nsec: u32
+    ) {
+        let mut content = self.0.lock().unwrap();
+        content.ready(object, tv_sec_hi, tv_sec_lo, tv_nsec);
+    }
+
+    fn failed(
+        &mut self,
+        object: ZwlrScreencopyFrameV1
+    ) {
+        let mut content = self.0.lock().unwrap();
+        content.failed(object);
+    }
+}
+
 pub struct WlrSource {
     display: wayland_client::Display,
     display_events: wayland_client::EventQueue,
@@ -33,6 +175,7 @@ pub struct WlrSource {
     xdg_outputs: LinkedList<zxdg_output_v1::ZxdgOutputV1>,
     output_metadata: Arc<RwLock<BTreeMap<u32, OutputMetadata>>>,
     current_output: Option<u32>,
+    current_frame: Option<Container<WlrFrame>>,
 }
 
 impl WlrSource {
@@ -137,6 +280,7 @@ impl obs::source::Source for WlrSource {
             xdg_outputs: LinkedList::new(),
             output_metadata: Arc::new(RwLock::new(BTreeMap::new())),
             current_output: None,
+            current_frame: None,
         };
 
         ret.update_xdg_outputs();
@@ -158,10 +302,14 @@ impl obs::source::Source for WlrSource {
         println!("obs_wlroots: update(output = {:?})", settings.get_string("output"));
 
         let output_metadata = self.output_metadata.read().unwrap();
+        let outputs = self.outputs.read().unwrap();
 
         self.current_output = output_metadata.iter()
             .find(|&(_id, meta)| meta.name == settings.get_str("output").unwrap_or(Cow::Borrowed(meta.name.as_ref())))
-            .map(|(&id, _meta)| id);
+            .map(|(&id, _meta)| id)
+            .and_then(move |id| outputs.get(&id).map(|_| id));
+
+        println!("obs_wlroots: update(current_output = {:?})", &self.current_output);
     }
 
     fn get_properties(&mut self) -> obs::Properties {
@@ -181,12 +329,45 @@ impl obs::source::Source for WlrSource {
 
 impl obs::source::VideoSource for WlrSource {
     fn width(&self) -> u32 {
-        // TODO: implement
-        0
+        self.current_frame.as_ref()
+            .map(|f| f.0.lock().unwrap())
+            .map(|f| f.width)
+            .unwrap_or(0)
     }
 
     fn height(&self) -> u32 {
-        // TODO: implement
-        0
+        self.current_frame.as_ref()
+            .map(|f| f.0.lock().unwrap())
+            .map(|f| f.height)
+            .unwrap_or(0)
+    }
+
+    fn render(&mut self) {
+        use wayland_client::NewProxy;
+
+        let current_output = self.get_current_output();
+
+        if current_output.is_none() {
+            return;
+        }
+        let current_output = current_output.unwrap();
+
+        println!("obs_wlroots: render");
+
+        let c = Container::new(WlrFrame::new(self.shm.clone()));
+        self.current_frame = Some(c.clone());
+        let frame = self.screencopy_manager.capture_output(1, &current_output, move |f: NewProxy<_>| {
+            f.implement_threadsafe(c, ())
+        }).expect("error creating frame");
+        let mut waiting = true;
+        while waiting {
+            println!("obs_wlroots: render(waiting)");
+            self.display_events.sync_roundtrip()
+                .expect("Error waiting on display events");
+            {
+                let current_frame = self.current_frame.as_ref().unwrap().0.lock().unwrap();
+                waiting = current_frame.waiting;
+            }
+        }
     }
 }
