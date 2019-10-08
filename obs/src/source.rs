@@ -4,6 +4,23 @@ use std::ffi;
 use std::mem;
 use std::ptr;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct SourceHandle(*mut sys::obs_source_t);
+
+impl SourceHandle {
+    #[inline(always)]
+    pub fn new(handle: *mut sys::obs_source_t) -> Self {
+        SourceHandle(handle)
+    }
+
+    #[inline(always)]
+    pub fn as_raw(&self) -> *mut sys::obs_source_t {
+        self.0
+    }
+}
+
+unsafe impl Send for SourceHandle {}
+
 pub unsafe fn register_source(info: &'static sys::obs_source_info) {
     obs_register_source(info as *const sys::obs_source_info)
 }
@@ -49,7 +66,8 @@ pub fn empty_source() -> sys::obs_source_info {
         transition_start: None,
         transition_stop: None,
         get_defaults2: None,
-        get_properties2: None
+        get_properties2: None,
+        audio_mix: None,
     }
 }
 
@@ -102,6 +120,9 @@ pub trait VideoSource: Source {
     fn render(&mut self);
 }
 
+pub trait AsyncVideoSource: Source {
+}
+
 unsafe extern "C" fn video_get_width<S: VideoSource>(data: *mut ffi::c_void) -> u32 {
     let data: &mut S = mem::transmute(data);
     data.width()
@@ -139,5 +160,18 @@ pub fn video_source_info<S: VideoSource>() -> SourceInfo {
     info.update = Some(update::<S>);
     info.get_properties = Some(get_properties::<S>);
     info.video_render = Some(video_render::<S>);
+    SourceInfo(info)
+}
+
+pub fn async_video_source_info<S: AsyncVideoSource>() -> SourceInfo {
+    let mut info = empty_source();
+    info.id = ffi::CStr::from_bytes_with_nul(S::ID).expect("Invalid ID").as_ptr();
+    info.type_ = sys::obs_source_type_OBS_SOURCE_TYPE_INPUT;
+    info.output_flags = sys::OBS_SOURCE_ASYNC_VIDEO;
+    info.get_name = Some(get_name::<S>);
+    info.create = Some(create::<S>);
+    info.destroy = Some(destroy::<S>);
+    info.update = Some(update::<S>);
+    info.get_properties = Some(get_properties::<S>);
     SourceInfo(info)
 }
