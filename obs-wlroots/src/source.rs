@@ -1,334 +1,82 @@
-use std::borrow::Cow;
-use std::collections::{BTreeMap, LinkedList};
-use std::sync::{atomic, Arc, RwLock, Mutex};
+use std::cell::Cell;
+use std::collections::BTreeMap;
+use std::mem;
+use std::sync::{
+    Arc,
+    RwLock,
+    Mutex
+};
+use std::sync::atomic::{self, AtomicBool, AtomicU32};
 use std::thread;
+use std::time;
 use ::obs::sys as obs_sys;
-use crate::shm;
-use wayland_client::protocol::wl_output;
-use wayland_client::protocol::wl_shm;
-use wayland_client::protocol::wl_shm_pool;
-use wayland_protocols::unstable::xdg_output::v1::client::zxdg_output_manager_v1;
+use wayland_client::{
+    Attached,
+    Display,
+    EventQueue,
+    GlobalManager,
+    GlobalEvent,
+    Interface,
+    Main
+};
+use wayland_client::protocol::wl_buffer::WlBuffer;
+use wayland_client::protocol::wl_output::WlOutput;
+use wayland_client::protocol::wl_shm::{self, WlShm};
+use wayland_client::protocol::wl_shm_pool::WlShmPool;
+use wayland_protocols::unstable::xdg_output::v1::client::zxdg_output_manager_v1::ZxdgOutputManagerV1;
 use wayland_protocols::unstable::xdg_output::v1::client::zxdg_output_v1;
-use wayland_protocols::wlr::unstable::screencopy::v1::client::zwlr_screencopy_manager_v1;
 use wayland_protocols::wlr::unstable::screencopy::v1::client::zwlr_screencopy_frame_v1::{self, ZwlrScreencopyFrameV1};
-
-const SOURCE_INFO_ID: &'static [u8] = b"obs_wlroots\0";
-const SOURCE_NAME: &'static [u8] = b"wlroots output\0";
-
-struct VideoThread {
-    thread: Option<thread::JoinHandle<()>>,
-    running: Arc<atomic::AtomicBool>,
-}
-
-impl VideoThread {
-    pub fn new(
-        source: obs::source::SourceHandle,
-        output_id: u32,
-        overlay_cursor: bool,
-        display: Arc<wayland_client::Display>,
-    ) -> VideoThread {
-        use wayland_client::NewProxy;
-
-        let running = Arc::new(atomic::AtomicBool::new(true));
-        let stored_running = running.clone();
-        let t = thread::spawn(move || {
-            let mut display_events = display.create_event_queue();
-            let output: Arc<RwLock<Option<wl_output::WlOutput>>> = Arc::new(RwLock::new(None));
-            let gm_output = output.clone();
-            let gm_running = running.clone();
-            let global_manager = wayland_client::GlobalManager::new(&display);
-            display_events.sync_roundtrip()
-                .expec
-            if output.read().unwrap().is_none() {
-                running.store(false, atomic::Ordering::Relaxed);
-                return;
-            }
-            let shm = global_manager.instantiate_exact::<wl_shm::WlShm, _>(1, |shm| shm.implement_dummy())
-                .expect("Error creating wl_shm");
-            let screencopy_manager = global_manager.instantiate_exact::<zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1, _>(1, |mgr| mgr.implement_dummy())
-                .expect("Error creating wlr_screencopy_manager_v1");
-            display_events.sync_roundtrip();
-            let frame = WlrFrame::new(source, shm);
-            let waiting = frame.waiting.clone();
-            let mut frame = Container::new(frame);
-            while running.load(atomic::Ordering::Relaxed) {
-                let output = output.read().unwrap();
-                if output.is_none() {
-                    return;
-                }
-                let output = output.as_ref().unwrap();
-                if !waiting.compare_and_swap(false, true, atomic::Ordering::SeqCst) {
-                    let frame = frame.clone();
-                    // let wlr_frame = screencopy_manager.capture_output(overlay_cursor as i32, output, move |f: NewProxy<_>| {
-                    //     f.implement(frame, ())
-                    // }).expect("error creating frame");
-                }
-                display_events.sync_roundtrip()
-                    .expect("error waiting on display events");
-            }
-        });
-        VideoThread {
-            thread: Some(t),
-            running: stored_running,
-        }
-    }
-}
-
-impl Drop for VideoThread {
-    fn drop(&mut self) {
-        self.running.store(false, atomic::Ordering::Relaxed);
-        self.thread.take().map(thread::JoinHandle::join);
-    }
-}
-
-struct OutputMetadata {
-    name: String,
-}
-
-impl OutputMetadata {
-    fn new() -> OutputMetadata {
-        OutputMetadata {
-            name: "<unknown>".to_string(),
-        }
-    }
-}
-
-struct WlrFrame {
-    fd: Option<shm::ShmFd<&'static str>>,
-    shm: wl_shm::WlShm,
-    pool: Option<wl_shm_pool::WlShmPool>,
-    buffer: Option<wayland_client::protocol::wl_buffer::WlBuffer>,
-    format: u32,
-    width: u32,
-    height: u32,
-    stride: u32,
-    current_size: usize,
-    source_handle: obs::source::SourceHandle,
-    waiting: Arc<atomic::AtomicBool>,
-}
-
-const WLR_FRAME_SHM_PATH: &'static str = "/obs_wlroots";
-
-impl WlrFrame {
-    fn new(source: obs::source::SourceHandle, shm: wl_shm::WlShm) -> WlrFrame {
-        WlrFrame {
-            fd: None,
-            shm: shm,
-            pool: None,
-            buffer: None,
-            format: 0,
-            width: 0,
-            height: 0,
-            stride: 0,
-            current_size: 0,
-            source_handle: source,
-            waiting: Arc::new(atomic::AtomicBool::new(false)),
-        }
-    }
-
-    pub fn size(&self) -> usize {
-        (self.height as usize) * (self.stride as usize)
-    }
-
-    fn ensure_size(&mut self) {
-        use wayland_client::NewProxy;
-        if self.fd.is_none() || self.current_size < self.size() {
-            self.fd = shm::ShmFd::open(WLR_FRAME_SHM_PATH, libc::O_CREAT | libc::O_RDWR, 0).ok();
-            unsafe {
-                shm::unlink(WLR_FRAME_SHM_PATH);
-                libc::ftruncate(self.fd.as_ref().unwrap().as_raw(), self.size() as libc::off_t);
-            }
-            let new_pool = self.shm.create_pool(self.fd.as_ref().map(shm::ShmFd::as_raw).unwrap(), self.size() as i32, |p: NewProxy<_>| p.implement_dummy()).unwrap();
-            let new_buffer = new_pool.create_buffer(0, self.width as i32, self.height as i32, self.stride as i32, self.buffer_format().unwrap(), |b: NewProxy<_>| b.implement_dummy()).unwrap();
-            self.buffer = Some(new_buffer);
-            self.pool = Some(new_pool);
-            self.current_size = self.size();
-        }
-    }
-
-    #[inline(always)]
-    fn buffer_format(&self) -> Option<wl_shm::Format> {
-        wl_shm::Format::from_raw(self.format)
-    }
-}
-
-impl Drop for WlrFrame {
-    fn drop(&mut self) {
-        println!("obs_wlroots: WlrFrame::drop");
-    }
-}
-
-impl zwlr_screencopy_frame_v1::EventHandler for WlrFrame {
-    fn buffer(
-        &mut self,
-        object: ZwlrScreencopyFrameV1,
-        format: u32,
-        width: u32,
-        height: u32,
-        stride: u32
-    ) {
-        use wayland_client::NewProxy;
-        println!("obs_wlroots: WlrFrame: buffer");
-
-        self.format = format;
-        self.width = width;
-        self.height = height;
-        self.stride = stride;
-        self.ensure_size();
-        object.copy(self.buffer.as_ref().unwrap());
-    }
-
-    fn ready(
-        &mut self,
-        object: ZwlrScreencopyFrameV1,
-        tv_sec_hi: u32,
-        tv_sec_lo: u32,
-        tv_nsec: u32
-    ) {
-        println!("obs_wlroots: WlrFrame: ready");
-        self.waiting.store(false, atomic::Ordering::Relaxed);
-        object.destroy();
-    }
-
-    fn failed(
-        &mut self,
-        object: ZwlrScreencopyFrameV1
-    ) {
-        println!("obs_wlroots: WlrFrame: failed");
-        self.waiting.store(false, atomic::Ordering::Relaxed);
-        object.destroy();
-    }
-}
-
-struct Container<T>(Arc<Mutex<T>>);
-
-impl<T> Clone for Container<T> {
-    fn clone(&self) -> Self {
-        Container(self.0.clone())
-    }
-}
-
-impl<T: Sized> Container<T> {
-    fn new(value: T) -> Container<T> {
-        Container(Arc::new(Mutex::new(value)))
-    }
-}
-
-impl<T: zwlr_screencopy_frame_v1::EventHandler> zwlr_screencopy_frame_v1::EventHandler for Container<T> {
-    fn buffer(
-        &mut self,
-        object: ZwlrScreencopyFrameV1,
-        format: u32,
-        width: u32,
-        height: u32,
-        stride: u32
-    ) {
-        let mut content = self.0.lock().unwrap();
-        content.buffer(object, format, width, height, stride);
-    }
-
-    fn ready(
-        &mut self,
-        object: ZwlrScreencopyFrameV1,
-        tv_sec_hi: u32,
-        tv_sec_lo: u32,
-        tv_nsec: u32
-    ) {
-        let mut content = self.0.lock().unwrap();
-        content.ready(object, tv_sec_hi, tv_sec_lo, tv_nsec);
-    }
-
-    fn failed(
-        &mut self,
-        object: ZwlrScreencopyFrameV1
-    ) {
-        let mut content = self.0.lock().unwrap();
-        content.failed(object);
-    }
-}
+use wayland_protocols::wlr::unstable::screencopy::v1::client::zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1;
+use crate::shm::{self, ShmFd};
 
 pub struct WlrSource {
-    display: Arc<wayland_client::Display>,
-    display_events: wayland_client::EventQueue,
-    shm: wl_shm::WlShm,
-    output_manager: zxdg_output_manager_v1::ZxdgOutputManagerV1,
-    screencopy_manager: zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1,
-    outputs: Arc<RwLock<BTreeMap<u32, wl_output::WlOutput>>>,
-    xdg_outputs: LinkedList<zxdg_output_v1::ZxdgOutputV1>,
-    output_metadata: Arc<RwLock<BTreeMap<u32, OutputMetadata>>>,
-    current_output: Option<u32>,
-    source_handle: obs::source::SourceHandle,
+    display: Arc<Display>,
+    display_events: EventQueue,
+    wl_outputs: Arc<RwLock<BTreeMap<u32, Arc<Main<WlOutput>>>>>,
+    outputs: BTreeMap<u32, Arc<RwLock<WlrOutput>>>,
+    output_manager: Main<ZxdgOutputManagerV1>,
     video_thread: Option<VideoThread>,
+    source_handle: obs::source::SourceHandle,
 }
 
 impl WlrSource {
-    fn update_xdg_outputs(&mut self) {
-        use wayland_client::NewProxy;
-
-        let outputs = self.outputs.read().unwrap();
-        self.xdg_outputs = LinkedList::new();
-        for (&id, output) in outputs.iter() {
-            let output_metadata = self.output_metadata.clone();
-            let xdg_output = self.output_manager.get_xdg_output(output, move |output: NewProxy<_>| {
-                let output_metadata = output_metadata.clone();
-                output.implement_closure(move |event, _proxy| {
-                    let output_metadata = output_metadata.clone();
-                    let mut output_metadata = output_metadata.write().unwrap();
-                    match event {
-                        zxdg_output_v1::Event::Name { name } => {
-                            output_metadata.insert(id, OutputMetadata {
-                                name: name,
-                            });
-                        },
-                        _ => {},
-                    }
-                }, ())
-            }).expect("Error creating xdg output interface");
-            self.xdg_outputs.push_back(xdg_output);
+    fn update_xdg(&mut self) {
+        for (&id, ref wl_output) in self.wl_outputs.read().unwrap().iter() {
+            self.outputs.remove(&id);
+            self.outputs.insert(id, WlrOutput::new(wl_output, id, &self.output_manager));
         }
-        self.display_events.sync_roundtrip()
+        self.display_events.sync_roundtrip(|_, _| {})
             .expect("Error waiting on display events");
-    }
-
-    pub fn get_current_output(&self) -> Option<wl_output::WlOutput> {
-        let outputs = self.outputs.read().unwrap();
-        self.current_output
-            .as_ref()
-            .and_then(|id| outputs.get(id))
-            .map(Clone::clone)
     }
 }
 
 impl obs::source::Source for WlrSource {
-    const ID: &'static [u8] = SOURCE_INFO_ID;
-    const NAME: &'static [u8] = SOURCE_NAME;
+    const ID: &'static [u8] = b"obs_wlroots\0";
+    const NAME: &'static [u8] = b"wlroots capture\0";
+
     fn create(settings: &mut obs_sys::obs_data_t, source: &mut obs_sys::obs_source_t) -> Result<WlrSource, String> {
         use obs::data::ObsData;
-        use wayland_client::{Display, GlobalManager};
 
-        let (display, mut display_events) = settings.get_str("display")
+        let display = settings.get_str("display")
             .map(|name| name.into_owned())
             .filter(|name| name.len() != 0)
             .map(|display_name| Display::connect_to_name(display_name))
-            .unwrap_or_else(|| Display::connect_to_env())
+            .unwrap_or_else(Display::connect_to_env)
             .map_err(|e| format!("Error connecting to wayland display: {}", e))?;
+        let mut display_events = display.create_event_queue();
+        let source_display = (*display).clone().attach(display_events.get_token());
 
-        let outputs = Arc::new(RwLock::new(BTreeMap::new()));
-        let outputs_clone = outputs.clone();
+        let outputs: Arc<RwLock<BTreeMap<u32, Arc<Main<WlOutput>>>>> = Arc::new(RwLock::new(BTreeMap::new()));
 
-        let mut _status = display_events.sync_roundtrip()
-            .map_err(|e| format!("Error waiting on display events: {}", e))?;
-
-        let global_manager = GlobalManager::new_with_cb(&display, move |event, registry| {
-            use wayland_client::{GlobalEvent, Interface, NewProxy};
-            let mut outputs = outputs.write().unwrap();
-            match event {
+        let gm_outputs = outputs.clone();
+        let global_manager = GlobalManager::new_with_cb(&source_display, move |evt, registry| {
+            let mut outputs = gm_outputs.write().unwrap();
+            match evt {
                 GlobalEvent::New { id, interface, version } => {
                     match interface.as_ref() {
-                        <wl_output::WlOutput as Interface>::NAME => {
-                            let output = registry.bind::<wl_output::WlOutput, _>(version, id, |output: NewProxy<_>| output.implement_dummy())
-                                .expect("Error binding output interface");
-                            outputs.insert(id, output);
+                        <WlOutput as Interface>::NAME => {
+                            let output = registry.bind::<WlOutput>(version, id);
+                            outputs.insert(id, Arc::new(output));
                         },
                         _ => {},
                     }
@@ -338,126 +86,291 @@ impl obs::source::Source for WlrSource {
                 },
             }
         });
-
-        let _status = display_events.sync_roundtrip()
+        display_events.sync_roundtrip(|_, _| {})
             .map_err(|e| format!("Error waiting on display events: {}", e))?;
-
-        let shm = global_manager.instantiate_exact::<wl_shm::WlShm, _>(1, |shm| shm.implement_dummy())
-            .map_err(|e| format!("Error creating shm interface: {}", e))?;
-        let output_manager = global_manager.instantiate_exact::<zxdg_output_manager_v1::ZxdgOutputManagerV1, _>(2, |mgr| mgr.implement_dummy())
-            .map_err(|e| format!("Error creating output manager interface: {}", e))?;
-        let screencopy_manager = global_manager.instantiate_exact::<zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1, _>(1, |mgr| mgr.implement_dummy())
-            .map_err(|e| format!("Error creating screencopy manager interface: {}", e))?;
-
-        for (id, interface, version) in global_manager.list() {
-            println!("{}: {} (version {})", id, interface, version);
-        }
-
+        let output_manager = global_manager.instantiate_exact::<ZxdgOutputManagerV1>(2)
+            .map_err(|e| format!("Error instantiating {}: {}", <ZxdgOutputManagerV1 as Interface>::NAME, e))?;
+        display_events.sync_roundtrip(|_, _| {})
+            .map_err(|e| format!("Error waiting on display events: {}", e))?;
+        
         let mut ret = WlrSource {
             display: Arc::new(display),
             display_events: display_events,
-            shm: shm,
+            wl_outputs: outputs,
             output_manager: output_manager,
-            screencopy_manager: screencopy_manager,
-            outputs: outputs_clone,
-            xdg_outputs: LinkedList::new(),
-            output_metadata: Arc::new(RwLock::new(BTreeMap::new())),
-            current_output: None,
-            source_handle: obs::source::SourceHandle::new(source as *mut obs_sys::obs_source_t),
+            outputs: BTreeMap::new(),
             video_thread: None,
+            source_handle: obs::source::SourceHandle::new(source as *mut obs_sys::obs_source_t),
         };
-
-        ret.update_xdg_outputs();
-
-        {
-            let output_metadata = ret.output_metadata.read().unwrap();
-            for (&id, metadata) in output_metadata.iter() {
-                println!("output {}: {}", id, &metadata.name);
-            }
-        }
+        ret.update_xdg();
         ret.update(settings);
-
         Ok(ret)
     }
 
     fn update(&mut self, settings: &mut obs_sys::obs_data_t) {
+        use std::borrow::Cow;
         use obs::data::ObsData;
 
-        println!("obs_wlroots: update(output = {:?})", settings.get_string("output"));
-
-        let output_metadata = self.output_metadata.read().unwrap();
-        let outputs = self.outputs.read().unwrap();
-
-        self.current_output = output_metadata.iter()
-            .find(|&(_id, meta)| meta.name == settings.get_str("output").unwrap_or(Cow::Borrowed(meta.name.as_ref())))
-            .map(|(&id, _meta)| id)
-            .and_then(move |id| outputs.get(&id).map(|_| id));
-
-        println!("obs_wlroots: update(current_output = {:?})", &self.current_output);
-
-        self.video_thread = None;
-        self.video_thread = self.current_output
-            .map(|id| VideoThread::new(self.source_handle, id, true, self.display.clone()));
+        let current_output = self.outputs.iter()
+            .map(|(_, output)| output.read().unwrap())
+            .find(|output| {
+                output.name() == settings.get_str("output").unwrap_or(Cow::Borrowed(""))
+            })
+            .map(|output| output.handle.clone());
+        self.video_thread = current_output.map(|handle| VideoThread::new(handle, self.source_handle, self.display.clone(), time::Duration::from_millis(5)));
     }
 
     fn get_properties(&mut self) -> obs::Properties {
-        use obs::Properties;
         use obs::properties::PropertyList;
 
         let mut props = obs::Properties::new();
         let mut output_list = props.add_string_list("output", "Output");
 
-        let output_metadata = self.output_metadata.read().unwrap();
-        for (&id, ref metadata) in output_metadata.iter() {
-            output_list.add_item(&metadata.name, &metadata.name);
+        for (_, ref output) in self.outputs.iter() {
+            let output = output.read().unwrap();
+            let name = output.name();
+            output_list.add_item(name, name);
         }
+
         props
     }
 }
 
 impl obs::source::AsyncVideoSource for WlrSource {}
 
-// impl obs::source::VideoSource for WlrSource {
-//     fn width(&self) -> u32 {
-//         self.current_frame.as_ref()
-//             .map(|f| f.0.lock().unwrap())
-//             .map(|f| f.width)
-//             .unwrap_or(0)
-//     }
-// 
-//     fn height(&self) -> u32 {
-//         self.current_frame.as_ref()
-//             .map(|f| f.0.lock().unwrap())
-//             .map(|f| f.height)
-//             .unwrap_or(0)
-//     }
-// 
-//     fn render(&mut self) {
-//         use wayland_client::NewProxy;
-// 
-//         let current_output = self.get_current_output();
-// 
-//         if current_output.is_none() {
-//             return;
-//         }
-//         let current_output = current_output.unwrap();
-// 
-//         println!("obs_wlroots: render");
-// 
-//         let c = Container::new(WlrFrame::new(self.shm.clone()));
-//         self.current_frame = Some(c.clone());
-//         let frame = self.screencopy_manager.capture_output(1, &current_output, move |f: NewProxy<_>| {
-//             f.implement_threadsafe(c, ())
-//         }).expect("error creating frame");
-//         let mut waiting = true;
-//         while waiting {
-//             println!("obs_wlroots: render(waiting)");
-//             self.display_events.sync_roundtrip()
-//                 .expect("Error waiting on display events");
-//             {
-//                 let current_frame = self.current_frame.as_ref().unwrap().0.lock().unwrap();
-//                 waiting = current_frame.waiting;
-//             }
-//         }
-//     }
-// }
+pub struct VideoThread {
+    thread: Option<thread::JoinHandle<()>>,
+    running: Arc<AtomicBool>,
+}
+
+impl VideoThread {
+    fn new(output: WlOutput, source_handle: obs::source::SourceHandle, display: Arc<Display>, sleep_duration: time::Duration) -> VideoThread {
+        let running = Arc::new(AtomicBool::new(true));
+        let running_ret = running.clone();
+        let t = thread::spawn(move || {
+            let mut events = display.create_event_queue();
+            let video_display = (**display).clone().attach(events.get_token());
+            let global_manager = GlobalManager::new(&video_display);
+            events.sync_roundtrip(|_, _| {})
+                .expect("Error waiting on display events");
+            let screencopy_manager = global_manager.instantiate_exact::<ZwlrScreencopyManagerV1>(1)
+                .expect(&format!("Error instantiating {}", <ZwlrScreencopyManagerV1 as Interface>::NAME));
+            let shm = global_manager.instantiate_exact::<WlShm>(1)
+                .expect(&format!("Error instantiating {}", <WlShm as Interface>::NAME));
+            events.sync_roundtrip(|_, _| {})
+                .expect("Error waiting on display events");
+            let frame = WlrFrame::new((*shm).clone(), source_handle);
+            let mut start = time::Instant::now();
+            let mut frame_count = 0u64;
+            while running.load(atomic::Ordering::Relaxed) {
+
+                if WlrFrame::handle_output(&frame, &screencopy_manager, &output) {
+                    frame_count = frame_count + 1;
+                }
+                events.sync_roundtrip(|_, _| {})
+                    .expect("Error waiting on display events");
+                if (start.elapsed().as_millis() > 1000) {
+                    println!("obs_wlroots: fps = {}", frame_count);
+                    start = time::Instant::now();
+                    frame_count = 0;
+                }
+                thread::sleep(sleep_duration);
+            }
+            println!("obs_wlroots: VideoThread: done");
+        });
+        VideoThread {
+            thread: Some(t),
+            running: running_ret,
+        }
+    }
+}
+
+impl Drop for VideoThread {
+    fn drop(&mut self) {
+        if let Some(t) = self.thread.take() {
+            self.running.store(false, atomic::Ordering::Relaxed);
+            t.join().unwrap();
+        }
+    }
+}
+
+const WLR_FRAME_SHM_PATH: &'static str = "/obs_wlroots";
+
+struct WlrBuffer {
+    pool: Main<WlShmPool>,
+    buffer: Main<WlBuffer>,
+    fd: ShmFd<&'static str>,
+    size: usize,
+}
+
+impl WlrBuffer {
+    fn new(shm: &Attached<WlShm>, frame: &WlrFrame) -> WlrBuffer {
+        let size = frame.size();
+        let fd = ShmFd::open(WLR_FRAME_SHM_PATH, libc::O_CREAT | libc::O_RDWR, 0).unwrap();
+        unsafe {
+            shm::unlink(WLR_FRAME_SHM_PATH);
+            libc::ftruncate(fd.as_raw(), size as libc::off_t);
+        }
+        let pool  = shm.create_pool(fd.as_raw(), size as i32);
+        let buffer = pool.create_buffer(0, frame.width.get() as i32, frame.height.get() as i32, frame.stride.get() as i32, frame.buffer_format().unwrap());
+        WlrBuffer {
+            pool: pool,
+            buffer: buffer,
+            fd: fd,
+            size: size,
+        }
+    }
+
+    #[inline(always)]
+    pub fn size(&self) -> usize {
+        self.size
+    }
+}
+
+impl Drop for WlrBuffer {
+    fn drop(&mut self) {
+        self.buffer.destroy();
+        self.pool.destroy();
+    }
+}
+
+struct WlrFrame {
+    format: Cell<u32>,
+    width: Cell<u32>,
+    height: Cell<u32>,
+    stride: Cell<u32>,
+    buffer: Mutex<Option<WlrBuffer>>,
+    shm: Attached<WlShm>,
+    waiting: AtomicBool,
+    source_handle: obs::source::SourceHandle,
+}
+
+impl WlrFrame {
+    pub fn new(shm: Attached<WlShm>, source_handle: obs::source::SourceHandle) -> Arc<WlrFrame> {
+        Arc::new(WlrFrame {
+            format: Cell::new(0),
+            width: Cell::new(0),
+            height: Cell::new(0),
+            stride: Cell::new(0),
+            buffer: Mutex::new(None),
+            shm: shm,
+            waiting: AtomicBool::new(false),
+            source_handle: source_handle
+        })
+    }
+
+    pub fn handle_output(s: &Arc<WlrFrame>, screencopy_manager: &ZwlrScreencopyManagerV1, output: &WlOutput) -> bool {
+        if !s.waiting.compare_and_swap(false, true, atomic::Ordering::AcqRel) {
+            let handler = s.clone();
+            let frame = screencopy_manager.capture_output(1, output);
+            frame.assign_mono(move |obj, evt| handler.handle_frame_event(&obj, evt));
+            return true;
+        }
+        false
+    }
+
+    fn handle_frame_event(&self, frame: &ZwlrScreencopyFrameV1, event: zwlr_screencopy_frame_v1::Event) {
+        use zwlr_screencopy_frame_v1::Event;
+        match event {
+            Event::Buffer { format, width, height, stride } => {
+                self.format.set(format);
+                self.width.set(width);
+                self.height.set(height);
+                self.stride.set(stride);
+                let mut buffer = self.buffer.lock().unwrap();
+                let buffer_size = buffer.as_ref().map(WlrBuffer::size);
+                if buffer_size.is_none() || buffer_size != Some(self.size()) {
+                    println!("obs_wlroots: re-creating buffer");
+                    *buffer = Some(WlrBuffer::new(&self.shm, self));
+                }
+                frame.copy(&buffer.as_ref().unwrap().buffer);
+            },
+            Event::Ready { .. } => {
+                use std::ptr;
+                use crate::mmap::MappedMemory;
+                let buffer = self.buffer.lock().unwrap();
+                let buffer = buffer.as_ref().unwrap();
+                let buf = unsafe {
+                    MappedMemory::new(buffer.size(), libc::PROT_READ, libc::MAP_SHARED, buffer.fd.as_raw(), 0)
+                        .unwrap()
+                };
+                let mut source_frame = obs_sys::obs_source_frame {
+                    data: [ptr::null_mut(); 8],
+                    linesize: [0; 8],
+                    width: self.width.get(),
+                    height: self.height.get(),
+                    format: obs_sys::video_format_VIDEO_FORMAT_BGRA,
+                    flip: true,
+
+                    timestamp: 0,
+                    color_matrix: [0f32; 16],
+                    full_range: false,
+                    color_range_min: [0f32; 3],
+                    color_range_max: [0f32; 3],
+                    refs: 0,
+                    prev_frame: false
+                };
+                source_frame.data[0] = unsafe { mem::transmute(buf.as_raw()) };
+                source_frame.linesize[0] = self.stride.get();
+
+                unsafe {
+                    obs_sys::obs_source_output_video(self.source_handle.as_raw(), &source_frame);
+                }
+
+                self.waiting.store(false, atomic::Ordering::Relaxed);
+                frame.destroy();
+            },
+            Event::Failed => {
+                self.waiting.store(false, atomic::Ordering::Relaxed);
+                frame.destroy();
+            },
+            _ => {},
+        }
+    }
+
+    fn size(&self) -> usize {
+        (self.height.get() as usize) * (self.stride.get() as usize)
+    }
+
+    #[inline(always)]
+    fn buffer_format(&self) -> Option<wl_shm::Format> {
+        wl_shm::Format::from_raw(self.format.get())
+    }
+}
+
+pub struct WlrOutput {
+    handle: WlOutput,
+    id: u32,
+    name: Option<String>,
+}
+
+impl WlrOutput {
+    pub fn new(handle: &WlOutput, id: u32, output_manager: &ZxdgOutputManagerV1) -> Arc<RwLock<WlrOutput>> {
+        let xdg_output = output_manager.get_xdg_output(&handle);
+        let ret = Arc::new(RwLock::new(WlrOutput {
+            handle: handle.clone(),
+            id: id,
+            name: None,
+        }));
+        let output = ret.clone();
+        xdg_output.assign_mono(move |handle, evt| {
+            match evt {
+                zxdg_output_v1::Event::Name { name } => {
+                    let mut output = output.write().unwrap();
+                    output.name = Some(name);
+                },
+                zxdg_output_v1::Event::Done => {
+                    handle.destroy();
+                },
+                _ => {},
+            }
+        });
+        ret
+    }
+
+    fn name(&self) -> &str {
+        self.name.as_ref()
+            .map(|s| s.as_ref())
+            .unwrap_or("<unknown>")
+    }
+}

@@ -30,7 +30,10 @@ impl<S: AsRef<str>> ShmFd<S> {
 
 impl<S: AsRef<str>> Drop for ShmFd<S> {
     fn drop(&mut self) {
-        unsafe { unlink(self.path_ref()) };
+        unsafe {
+            libc::close(self.fd);
+            unlink(self.path_ref());
+        };
     }
 }
 

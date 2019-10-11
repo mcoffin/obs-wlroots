@@ -12,6 +12,7 @@ static mut SOURCE_INFO: Option<obs::source::SourceInfo> = None;
 
 pub mod source;
 pub(crate) mod shm;
+pub(crate) mod mmap;
 
 #[no_mangle]
 pub extern "C" fn obs_module_load() -> bool {

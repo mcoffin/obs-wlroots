@@ -11,10 +11,10 @@ crate-type = ["dylib"]
 
 [dependencies]
 libc = "*"
-wayland-client = "0.23"
+wayland-client = "0.24"
 
 [dependencies.wayland-protocols]
-version = "0.23"
+version = "0.24"
 features = ["client", "unstable_protocols"]
 
 [dependencies.obs]
