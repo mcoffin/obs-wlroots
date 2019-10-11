@@ -6,7 +6,7 @@ use std::sync::{
     RwLock,
     Mutex
 };
-use std::sync::atomic::{self, AtomicBool, AtomicU32};
+use std::sync::atomic::{self, AtomicBool};
 use std::thread;
 use std::time;
 use ::obs::sys as obs_sys;
@@ -43,7 +43,7 @@ impl WlrSource {
     fn update_xdg(&mut self) {
         for (&id, ref wl_output) in self.wl_outputs.read().unwrap().iter() {
             self.outputs.remove(&id);
-            self.outputs.insert(id, WlrOutput::new(wl_output, id, &self.output_manager));
+            self.outputs.insert(id, WlrOutput::new(wl_output, &self.output_manager));
         }
         self.display_events.sync_roundtrip(|_, _| {})
             .expect("Error waiting on display events");
@@ -169,7 +169,7 @@ impl VideoThread {
                 }
                 events.sync_roundtrip(|_, _| {})
                     .expect("Error waiting on display events");
-                if (start.elapsed().as_millis() > 1000) {
+                if start.elapsed().as_millis() > 1000 {
                     println!("obs_wlroots: fps = {}", frame_count);
                     start = time::Instant::now();
                     frame_count = 0;
@@ -299,7 +299,7 @@ impl WlrFrame {
                     linesize: [0; 8],
                     width: self.width.get(),
                     height: self.height.get(),
-                    format: obs_sys::video_format_VIDEO_FORMAT_BGRA,
+                    format: obs_sys::video_format::VIDEO_FORMAT_BGRA,
                     flip: true,
 
                     timestamp: 0,
@@ -340,16 +340,14 @@ impl WlrFrame {
 
 pub struct WlrOutput {
     handle: WlOutput,
-    id: u32,
     name: Option<String>,
 }
 
 impl WlrOutput {
-    pub fn new(handle: &WlOutput, id: u32, output_manager: &ZxdgOutputManagerV1) -> Arc<RwLock<WlrOutput>> {
+    pub fn new(handle: &WlOutput, output_manager: &ZxdgOutputManagerV1) -> Arc<RwLock<WlrOutput>> {
         let xdg_output = output_manager.get_xdg_output(&handle);
         let ret = Arc::new(RwLock::new(WlrOutput {
             handle: handle.clone(),
-            id: id,
             name: None,
         }));
         let output = ret.clone();

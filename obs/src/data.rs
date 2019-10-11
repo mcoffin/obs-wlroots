@@ -3,6 +3,42 @@ use ::obs_sys as sys;
 use std::borrow::Cow;
 use std::ffi;
 use std::mem;
+use std::ops::{Deref, DerefMut};
+
+pub struct Data(*mut sys::obs_data_t);
+
+impl Data {
+    pub unsafe fn from_raw(p: *mut sys::obs_data_t) -> Data {
+        sys::obs_data_addref(p);
+        Data(p)
+    }
+}
+
+impl Deref for Data {
+    type Target = sys::obs_data_t;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe {
+            self.0.as_ref().unwrap()
+        }
+    }
+}
+
+impl DerefMut for Data {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe {
+            self.0.as_mut().unwrap()
+        }
+    }
+}
+
+impl Drop for Data {
+    fn drop(&mut self) {
+        unsafe {
+            sys::obs_data_release(self.0);
+        }
+    }
+}
 
 pub trait ObsData {
     fn get_int<S: AsRef<str>>(&self, key: S) -> i64;

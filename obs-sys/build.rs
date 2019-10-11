@@ -12,6 +12,7 @@ fn main() {
         .header("wrapper.h")
         .blacklist_type("_bindgen_ty_2")
         .rustified_enum("obs_combo_format")
+        .rustified_enum("video_format")
         .generate()
         .expect("Error generating libobs bindings");
 
