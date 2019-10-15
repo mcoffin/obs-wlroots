@@ -32,7 +32,7 @@ impl Properties {
                 self.0,
                 mem::transmute(name.as_ptr()),
                 mem::transmute(description.as_ptr()),
-                sys::obs_combo_type_OBS_COMBO_TYPE_LIST,
+                sys::obs_combo_type::OBS_COMBO_TYPE_LIST,
                 sys::obs_combo_format::OBS_COMBO_FORMAT_STRING
             );
             StringPropertyList::from_raw(ptr)

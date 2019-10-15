@@ -8,6 +8,12 @@ use std::ops::{Deref, DerefMut};
 pub struct Data(*mut sys::obs_data_t);
 
 impl Data {
+    pub fn new(p: &mut sys::obs_data_t) -> Data {
+        unsafe {
+            Data::from_raw(p as *mut sys::obs_data_t)
+        }
+    }
+
     pub unsafe fn from_raw(p: *mut sys::obs_data_t) -> Data {
         sys::obs_data_addref(p);
         Data(p)

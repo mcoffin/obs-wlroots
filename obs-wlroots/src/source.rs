@@ -212,7 +212,8 @@ impl WlrBuffer {
             libc::ftruncate(fd.as_raw(), size as libc::off_t);
         }
         let pool  = shm.create_pool(fd.as_raw(), size as i32);
-        let buffer = pool.create_buffer(0, frame.width.get() as i32, frame.height.get() as i32, frame.stride.get() as i32, frame.buffer_format().unwrap());
+        let frame_meta = frame.metadata.get();
+        let buffer = pool.create_buffer(0, frame_meta.width as i32, frame_meta.height as i32, frame_meta.stride as i32, frame.buffer_format().unwrap());
         WlrBuffer {
             pool: pool,
             buffer: buffer,
@@ -234,11 +235,43 @@ impl Drop for WlrBuffer {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FrameMetadata {
+    format: u32,
+    width: u32,
+    height: u32,
+    stride: u32,
+}
+
+impl FrameMetadata {
+    pub fn new(format: u32, width: u32, height: u32, stride: u32) -> FrameMetadata {
+        FrameMetadata {
+            format: format,
+            width: width,
+            height: height,
+            stride: stride,
+        }
+    }
+
+    #[inline(always)]
+    pub fn size(&self) -> usize {
+        (self.height as usize) * (self.stride as usize)
+    }
+}
+
+impl Default for FrameMetadata {
+    fn default() -> Self {
+        FrameMetadata {
+            format: 0,
+            width: 0,
+            height: 0,
+            stride: 0,
+        }
+    }
+}
+
 struct WlrFrame {
-    format: Cell<u32>,
-    width: Cell<u32>,
-    height: Cell<u32>,
-    stride: Cell<u32>,
+    metadata: Cell<FrameMetadata>,
     buffer: Mutex<Option<WlrBuffer>>,
     shm: Attached<WlShm>,
     waiting: AtomicBool,
@@ -248,10 +281,7 @@ struct WlrFrame {
 impl WlrFrame {
     pub fn new(shm: Attached<WlShm>, source_handle: obs::source::SourceHandle) -> Arc<WlrFrame> {
         Arc::new(WlrFrame {
-            format: Cell::new(0),
-            width: Cell::new(0),
-            height: Cell::new(0),
-            stride: Cell::new(0),
+            metadata: Cell::new(FrameMetadata::default()),
             buffer: Mutex::new(None),
             shm: shm,
             waiting: AtomicBool::new(false),
@@ -273,10 +303,7 @@ impl WlrFrame {
         use zwlr_screencopy_frame_v1::Event;
         match event {
             Event::Buffer { format, width, height, stride } => {
-                self.format.set(format);
-                self.width.set(width);
-                self.height.set(height);
-                self.stride.set(stride);
+                self.metadata.set(FrameMetadata::new(format, width, height, stride));
                 let mut buffer = self.buffer.lock().unwrap();
                 let buffer_size = buffer.as_ref().map(WlrBuffer::size);
                 if buffer_size.is_none() || buffer_size != Some(self.size()) {
@@ -294,11 +321,12 @@ impl WlrFrame {
                     MappedMemory::new(buffer.size(), libc::PROT_READ, libc::MAP_SHARED, buffer.fd.as_raw(), 0)
                         .unwrap()
                 };
+                let meta = self.metadata.get();
                 let mut source_frame = obs_sys::obs_source_frame {
                     data: [ptr::null_mut(); 8],
                     linesize: [0; 8],
-                    width: self.width.get(),
-                    height: self.height.get(),
+                    width: meta.width,
+                    height: meta.height,
                     format: obs_sys::video_format::VIDEO_FORMAT_BGRA,
                     flip: true,
 
@@ -311,7 +339,7 @@ impl WlrFrame {
                     prev_frame: false
                 };
                 source_frame.data[0] = unsafe { mem::transmute(buf.as_raw()) };
-                source_frame.linesize[0] = self.stride.get();
+                source_frame.linesize[0] = meta.stride;
 
                 unsafe {
                     obs_sys::obs_source_output_video(self.source_handle.as_raw(), &source_frame);
@@ -329,12 +357,13 @@ impl WlrFrame {
     }
 
     fn size(&self) -> usize {
-        (self.height.get() as usize) * (self.stride.get() as usize)
+        let meta = self.metadata.get();
+        meta.size()
     }
 
     #[inline(always)]
     fn buffer_format(&self) -> Option<wl_shm::Format> {
-        wl_shm::Format::from_raw(self.format.get())
+        wl_shm::Format::from_raw(self.metadata.get().format)
     }
 }
 

@@ -29,10 +29,10 @@ pub unsafe fn obs_register_source(info: *const sys::obs_source_info) {
     sys::obs_register_source_s(info, mem::size_of::<sys::obs_source_info>());
 }
 
-pub fn empty_source() -> sys::obs_source_info {
+fn empty_source(t: sys::obs_source_type) -> sys::obs_source_info {
     sys::obs_source_info {
         id: ptr::null(),
-        type_: 0,
+        type_: t,
         output_flags: 0,
         get_name: None,
         create: None,
@@ -148,9 +148,9 @@ impl SourceInfo {
 }
 
 pub fn video_source_info<S: VideoSource>() -> SourceInfo {
-    let mut info = empty_source();
+    let mut info = empty_source(sys::obs_source_type::OBS_SOURCE_TYPE_INPUT);
     info.id = ffi::CStr::from_bytes_with_nul(S::ID).expect("Invalid ID").as_ptr();
-    info.type_ = sys::obs_source_type_OBS_SOURCE_TYPE_INPUT;
+    info.type_ = sys::obs_source_type::OBS_SOURCE_TYPE_INPUT;
     info.output_flags = sys::OBS_SOURCE_VIDEO;
     info.get_name = Some(get_name::<S>);
     info.create = Some(create::<S>);
@@ -164,9 +164,9 @@ pub fn video_source_info<S: VideoSource>() -> SourceInfo {
 }
 
 pub fn async_video_source_info<S: AsyncVideoSource>() -> SourceInfo {
-    let mut info = empty_source();
+    let mut info = empty_source(sys::obs_source_type::OBS_SOURCE_TYPE_INPUT);
     info.id = ffi::CStr::from_bytes_with_nul(S::ID).expect("Invalid ID").as_ptr();
-    info.type_ = sys::obs_source_type_OBS_SOURCE_TYPE_INPUT;
+    info.type_ = sys::obs_source_type::OBS_SOURCE_TYPE_INPUT;
     info.output_flags = sys::OBS_SOURCE_ASYNC_VIDEO;
     info.get_name = Some(get_name::<S>);
     info.create = Some(create::<S>);
