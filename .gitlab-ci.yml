@@ -1,0 +1,5 @@
+image: "rust:1"
+
+build:
+  script:
+    - cargo build --release
