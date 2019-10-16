@@ -11,7 +11,10 @@ crate-type = ["dylib"]
 
 [dependencies]
 libc = "*"
-wayland-client = "0.24"
+
+[dependencies.wayland-client]
+version = "0.24"
+features = ["use_system_lib"]
 
 [dependencies.wayland-protocols]
 version = "0.24"

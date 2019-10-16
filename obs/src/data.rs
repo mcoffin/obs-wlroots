@@ -46,6 +46,8 @@ impl Drop for Data {
     }
 }
 
+unsafe impl Send for Data {}
+
 pub trait ObsData {
     fn get_int<S: AsRef<str>>(&self, key: S) -> i64;
     fn get_string<S: AsRef<str>>(&self, key: S) -> Option<&ffi::CStr>;

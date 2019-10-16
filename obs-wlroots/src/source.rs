@@ -32,25 +32,25 @@ use crate::shm::ShmFd;
 use crate::mmap::MappedMemory;
 
 pub struct WlrSource {
-    display: Arc<Display>,
-    display_events: EventQueue,
-    wl_outputs: Arc<RwLock<BTreeMap<u32, Arc<Main<WlOutput>>>>>,
-    outputs: BTreeMap<u32, Arc<RwLock<WlrOutput>>>,
-    output_manager: Main<ZxdgOutputManagerV1>,
-    video_thread: Option<VideoThread>,
+    outputs: Arc<RwLock<BTreeMap<String, WlrOutput>>>,
     source_handle: obs::source::SourceHandle,
+    output_thread: Option<thread::JoinHandle<()>>,
+    output_running: Arc<AtomicBool>,
+    update_thread: Option<thread::JoinHandle<()>>,
+    update_sender: mpsc::SyncSender<Option<obs::data::Data>>,
+    video_receiver: Option<mpsc::Receiver<FrameData>>,
+    should_render: Arc<AtomicBool>,
     last_width: u32,
     last_height: u32,
 }
 
-impl WlrSource {
-    fn update_xdg(&mut self) {
-        for (&id, ref wl_output) in self.wl_outputs.read().unwrap().iter() {
-            self.outputs.remove(&id);
-            self.outputs.insert(id, WlrOutput::new(wl_output, &self.output_manager));
-        }
-        self.display_events.sync_roundtrip(|_, _| {})
-            .expect("Error waiting on display events");
+impl Drop for WlrSource {
+    fn drop(&mut self) {
+        println!("obs_wlroots: WlrSource::drop");
+        self.output_running.store(false, atomic::Ordering::Relaxed);
+        self.output_thread.take().map(|t| t.join());
+        mem::drop(self.video_receiver.take());
+        self.update_thread.take().map(|t| t.join());
     }
 }
 
@@ -67,64 +67,132 @@ impl obs::source::Source for WlrSource {
             .map(|display_name| Display::connect_to_name(display_name))
             .unwrap_or_else(Display::connect_to_env)
             .map_err(|e| format!("Error connecting to wayland display: {}", e))?;
-        let mut display_events = display.create_event_queue();
-        let source_display = (*display).clone().attach(display_events.get_token());
+        let display = Arc::new(display);
+        let xdg_outputs: Arc<RwLock<BTreeMap<String, WlrOutput>>> = Arc::new(RwLock::new(BTreeMap::new()));
+        let output_running = Arc::new(AtomicBool::new(true));
+        let (update_sender, update_receiver) = mpsc::sync_channel::<Option<obs::data::Data>>(1);
+        let source_handle = obs::source::SourceHandle::new(source as *mut obs_sys::obs_source_t);
+        let (video_sender, video_receiver) = mpsc::sync_channel(1);
+        let should_render = Arc::new(AtomicBool::new(false));
+        let update_thread = {
+            let display = display.clone();
+            let xdg_outputs = xdg_outputs.clone();
+            let should_render = should_render.clone();
+            let builder = thread::Builder::new()
+                .name("obs-wlroots:update".into());
+            builder.spawn(move || {
+                use std::borrow::Cow;
 
-        let outputs: Arc<RwLock<BTreeMap<u32, Arc<Main<WlOutput>>>>> = Arc::new(RwLock::new(BTreeMap::new()));
-
-        let gm_outputs = outputs.clone();
-        let global_manager = GlobalManager::new_with_cb(&source_display, move |evt, registry| {
-            let mut outputs = gm_outputs.write().unwrap();
-            match evt {
-                GlobalEvent::New { id, interface, version } => {
-                    match interface.as_ref() {
-                        <WlOutput as Interface>::NAME => {
-                            let output = registry.bind::<WlOutput>(version, id);
-                            outputs.insert(id, Arc::new(output));
-                        },
-                        _ => {},
+                let display = display;
+                let mut video_thread: Option<VideoThread> = None;
+                let mut last_settings: Option<obs::data::Data> = None;
+                while let Ok(settings) = update_receiver.recv() {
+                    println!("obs_wlroots: update");
+                    if settings.is_some() {
+                        last_settings = settings;
                     }
-                },
-                GlobalEvent::Removed { id, .. } => {
-                    outputs.remove(&id);
-                },
-            }
-        });
-        display_events.sync_roundtrip(|_, _| {})
-            .map_err(|e| format!("Error waiting on display events: {}", e))?;
-        let output_manager = global_manager.instantiate_exact::<ZxdgOutputManagerV1>(2)
-            .map_err(|e| format!("Error instantiating {}: {}", <ZxdgOutputManagerV1 as Interface>::NAME, e))?;
-        display_events.sync_roundtrip(|_, _| {})
-            .map_err(|e| format!("Error waiting on display events: {}", e))?;
-        
+                    if let Some(settings) = last_settings.as_ref() {
+                        let current_output = {
+                            let xdg_outputs = xdg_outputs.read().unwrap();
+                            xdg_outputs.get(settings.get_str("output").unwrap_or(Cow::Borrowed("")).as_ref())
+                                .map(|output| output.handle.clone())
+                        };
+                        mem::drop(video_thread.take());
+                        video_thread = current_output.map(|handle| {
+                            VideoThread::new(handle, source_handle, display.clone(), video_sender.clone())
+                        });
+                    }
+                    should_render.store(video_thread.is_some(), atomic::Ordering::Relaxed);
+                }
+                mem::drop(video_thread.take());
+            }).unwrap()
+        };
+        let output_thread = {
+            let display = display.clone();
+            let xdg_outputs = xdg_outputs.clone();
+            let output_running = output_running.clone();
+            let update_sender = update_sender.clone();
+            let builder = thread::Builder::new()
+                .name("obs-wlroots:output".into());
+            let obs_thread = thread::current();
+            builder.spawn(move || {
+                use std::rc::Rc;
+                use std::cell::RefCell;
+                let update_sender = update_sender;
+                let mut output_events = display.create_event_queue();
+                let output_display = (**display).clone().attach(output_events.get_token());
+                let output_manager: Rc<RefCell<Option<Attached<ZxdgOutputManagerV1>>>> = Rc::new(RefCell::new(None));
+                let gm_output_manager = output_manager.clone();
+                let tmp_xdg_outputs = xdg_outputs.clone();
+                let gm_update_sender = update_sender.clone();
+                let global_manager = GlobalManager::new_with_cb(&output_display, move |evt, registry| {
+                    let output_manager = gm_output_manager.borrow();
+                    if let Some(output_manager) = output_manager.as_ref() {
+                        match evt {
+                            GlobalEvent::New { id, interface, version } => {
+                                if &interface == <WlOutput as Interface>::NAME {
+                                    let output = registry.bind::<WlOutput>(version, id);
+                                    WlrOutput::new(id, &output, output_manager, &xdg_outputs, gm_update_sender.clone());
+                                }
+                            },
+                            GlobalEvent::Removed { id, interface } => {
+                                if &interface == <WlOutput as Interface>::NAME {
+                                    let mut outputs = xdg_outputs.write().unwrap();
+                                    let maybe_name = outputs.iter()
+                                        .find(|&(_name, output)| output.id() == id)
+                                        .map(|(name, _)| name.clone());
+                                    if let Some(name) = maybe_name {
+                                        outputs.remove(&name);
+                                        mem::drop(outputs);
+                                        gm_update_sender.send(None).unwrap();
+                                    }
+                                }
+                            },
+                        }
+                    }
+                });
+                output_events.sync_roundtrip(|_, _| {})
+                    .expect("Error waiting on events");
+                {
+                    let mut output_manager = output_manager.borrow_mut();
+                    *output_manager = global_manager.instantiate_exact::<ZxdgOutputManagerV1>(2)
+                        .map(|gm| (*gm).clone())
+                        .ok();
+                    for (id, interface, version) in global_manager.list() {
+                        if &interface == <WlOutput as Interface>::NAME {
+                            let output = output_display.get_registry().bind::<WlOutput>(version, id);
+                            WlrOutput::new(id, &output, output_manager.as_ref().unwrap(), &tmp_xdg_outputs, update_sender.clone());
+                        }
+                    }
+                }
+                mem::drop(tmp_xdg_outputs);
+                obs_thread.unpark();
+                while output_running.load(atomic::Ordering::Relaxed) {
+                    output_events.sync_roundtrip(|_, _| {})
+                        .map(|_| {})
+                        .unwrap_or_else(|_| output_running.store(false, atomic::Ordering::Relaxed));
+                }
+            }).unwrap()
+        };
+        thread::park();
         let mut ret = WlrSource {
-            display: Arc::new(display),
-            display_events: display_events,
-            wl_outputs: outputs,
-            output_manager: output_manager,
-            outputs: BTreeMap::new(),
-            video_thread: None,
-            source_handle: obs::source::SourceHandle::new(source as *mut obs_sys::obs_source_t),
+            outputs: xdg_outputs,
+            source_handle: source_handle,
+            output_thread: Some(output_thread),
+            output_running: output_running,
+            update_thread: Some(update_thread),
+            update_sender: update_sender,
+            video_receiver: Some(video_receiver),
+            should_render: should_render,
             last_width: 0,
             last_height: 0,
         };
-        ret.update_xdg();
         ret.update(settings);
         Ok(ret)
     }
 
     fn update(&mut self, settings: &mut obs_sys::obs_data_t) {
-        use std::borrow::Cow;
-        use obs::data::ObsData;
-
-        let current_output = self.outputs.iter()
-            .map(|(_, output)| output.read().unwrap())
-            .find(|output| {
-                output.name() == settings.get_str("output").unwrap_or(Cow::Borrowed(""))
-            })
-            .map(|output| output.handle.clone());
-        mem::drop(self.video_thread.take());
-        self.video_thread = current_output.map(|handle| VideoThread::new(handle, self.source_handle, self.display.clone()));
+        self.update_sender.send(Some(obs::data::Data::new(settings))).unwrap();
     }
 
     fn get_properties(&mut self) -> obs::Properties {
@@ -133,10 +201,11 @@ impl obs::source::Source for WlrSource {
         let mut props = obs::Properties::new();
         let mut output_list = props.add_string_list("output", "Output");
 
-        for (_, ref output) in self.outputs.iter() {
-            let output = output.read().unwrap();
-            let name = output.name();
-            output_list.add_item(name, name);
+        {
+            let outputs = self.outputs.read().unwrap();
+            for name in outputs.keys() {
+                output_list.add_item(name, name);
+            }
         }
 
         props
@@ -153,12 +222,16 @@ impl obs::source::VideoSource for WlrSource {
     }
 
     fn render(&mut self) {
-        if let Some(video_thread) = self.video_thread.as_mut() {
-            let FrameData(_mem, mut source_frame) = video_thread.receiver_mut().recv().unwrap();
-            self.last_width = source_frame.width;
-            self.last_height = source_frame.height;
-            let mut texture = obs::gs::Texture::from(&mut source_frame);
-            obs::source::obs_source_draw(&mut texture, 0, 0, 0, 0, source_frame.flip);
+        if self.should_render.load(atomic::Ordering::Relaxed) {
+            if let Some(video_receiver) = self.video_receiver.as_mut() {
+                let mut data = video_receiver.recv().unwrap();
+                let source_frame = data.as_source_frame();
+                self.last_width = source_frame.width;
+                self.last_height = source_frame.height;
+                let flip = source_frame.flip;
+                let mut texture = obs::gs::Texture::from(source_frame);
+                obs::source::obs_source_draw(&mut texture, 0, 0, 0, 0, flip);
+            }
         }
     }
 }
@@ -166,7 +239,6 @@ impl obs::source::VideoSource for WlrSource {
 pub struct VideoThread {
     thread: Option<thread::JoinHandle<()>>,
     running: Arc<AtomicBool>,
-    receiver: Option<mpsc::Receiver<FrameData>>,
 }
 
 #[no_mangle]
@@ -181,13 +253,13 @@ fn obs_wlroots_create_event_queue(display: &Display) -> EventQueue {
 }
 
 impl VideoThread {
-    fn new(output: WlOutput, source_handle: obs::source::SourceHandle, display: Arc<Display>) -> VideoThread {
+    fn new(output: WlOutput, source_handle: obs::source::SourceHandle, display: Arc<Display>, sender: mpsc::SyncSender<FrameData>) -> VideoThread {
         let running = Arc::new(AtomicBool::new(true));
         let running_ret = running.clone();
         let builder = thread::Builder::new()
             .name("obs-wlroots".into());
-        let (sender, receiver) = mpsc::sync_channel(1);
         let t = builder.spawn(move || {
+            println!("obs_wlroots: VideoThread: start");
             let mut events = obs_wlroots_create_event_queue(display.as_ref());
             let video_display = (**display).clone().attach(events.get_token());
             let global_manager = GlobalManager::new(&video_display);
@@ -225,13 +297,7 @@ impl VideoThread {
         VideoThread {
             thread: Some(t),
             running: running_ret,
-            receiver: Some(receiver),
         }
-    }
-
-    #[inline(always)]
-    fn receiver_mut(&mut self) -> &mut mpsc::Receiver<FrameData> {
-        self.receiver.as_mut().unwrap()
     }
 }
 
@@ -240,7 +306,6 @@ impl Drop for VideoThread {
         println!("obs_wlroots: VideoThread::drop");
         if let Some(t) = self.thread.take() {
             self.running.store(false, atomic::Ordering::Relaxed);
-            mem::drop(self.receiver.take());
             t.join().unwrap();
         }
     }
@@ -408,32 +473,43 @@ impl Drop for WlrFrame {
     }
 }
 
+#[derive(Clone)]
 pub struct WlrOutput {
+    id: u32,
     handle: WlOutput,
     name: Option<String>,
 }
 
 impl WlrOutput {
-    pub fn new(handle: &WlOutput, output_manager: &ZxdgOutputManagerV1) -> Arc<RwLock<WlrOutput>> {
+    pub fn new(id: u32, handle: &WlOutput, output_manager: &ZxdgOutputManagerV1, outputs: &Arc<RwLock<BTreeMap<String, WlrOutput>>>, sender: mpsc::SyncSender<Option<obs::data::Data>>) {
         let xdg_output = output_manager.get_xdg_output(&handle);
-        let ret = Arc::new(RwLock::new(WlrOutput {
+        let mut obj = WlrOutput {
+            id: id,
             handle: handle.clone(),
             name: None,
-        }));
-        let output = ret.clone();
+        };
+        let outputs = outputs.clone();
         xdg_output.assign_mono(move |handle, evt| {
             match evt {
                 zxdg_output_v1::Event::Name { name } => {
-                    let mut output = output.write().unwrap();
-                    output.name = Some(name);
+                    obj.name = Some(name);
                 },
                 zxdg_output_v1::Event::Done => {
+                    {
+                        let mut outputs = outputs.write().unwrap();
+                        outputs.insert(obj.name().to_string(), obj.clone());
+                        sender.send(None).unwrap();
+                    }
                     handle.destroy();
                 },
                 _ => {},
             }
         });
-        ret
+    }
+
+    #[inline(always)]
+    pub fn id(&self) -> u32 {
+        self.id
     }
 
     fn name(&self) -> &str {
@@ -443,11 +519,16 @@ impl WlrOutput {
     }
 }
 
-struct FrameData(MappedMemory, obs_sys::obs_source_frame);
+struct FrameData {
+    data: Vec<u8>,
+    meta: FrameMetadata,
+    source_frame: obs_sys::obs_source_frame,
+}
 
 impl FrameData {
     unsafe fn new(buf: MappedMemory, meta: &FrameMetadata) -> FrameData {
         use std::ptr;
+        use std::slice;
         let mut source_frame = obs_sys::obs_source_frame {
             data: [ptr::null_mut(); 8],
             linesize: [0; 8],
@@ -464,9 +545,20 @@ impl FrameData {
             refs: 0,
             prev_frame: false
         };
-        source_frame.data[0] = mem::transmute(buf.as_raw());
         source_frame.linesize[0] = meta.stride;
-        FrameData(buf, source_frame)
+        let buf = slice::from_raw_parts(mem::transmute(buf.as_raw()), meta.size());
+        let mut buf = Vec::from(buf);
+        source_frame.data[0] = buf.as_mut_ptr();
+        FrameData {
+            data: buf,
+            meta: *meta,
+            source_frame: source_frame
+        }
+    }
+
+    #[inline(always)]
+    fn as_source_frame(&mut self) -> &mut obs_sys::obs_source_frame {
+        &mut self.source_frame
     }
 }
 

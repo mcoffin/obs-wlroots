@@ -59,6 +59,7 @@ impl SemanticVersion {
 }
 
 impl Into<u32> for SemanticVersion {
+    #[inline(always)]
     fn into(self) -> u32 {
         self.0
     }
