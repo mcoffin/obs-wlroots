@@ -154,14 +154,11 @@ impl obs::source::VideoSource for WlrSource {
 
     fn render(&mut self) {
         if let Some(video_thread) = self.video_thread.as_mut() {
-            let unparked = video_thread.thread.as_ref().map(|t| t.thread().unpark());
-            if unparked.is_some() {
-                let FrameData(_mem, mut source_frame) = video_thread.receiver.recv().unwrap();
-                self.last_width = source_frame.width;
-                self.last_height = source_frame.height;
-                let mut texture = obs::gs::Texture::from(&mut source_frame);
-                obs::source::obs_source_draw(&mut texture, 0, 0, 0, 0, source_frame.flip);
-            }
+            let FrameData(_mem, mut source_frame) = video_thread.receiver_mut().recv().unwrap();
+            self.last_width = source_frame.width;
+            self.last_height = source_frame.height;
+            let mut texture = obs::gs::Texture::from(&mut source_frame);
+            obs::source::obs_source_draw(&mut texture, 0, 0, 0, 0, source_frame.flip);
         }
     }
 }
@@ -169,7 +166,7 @@ impl obs::source::VideoSource for WlrSource {
 pub struct VideoThread {
     thread: Option<thread::JoinHandle<()>>,
     running: Arc<AtomicBool>,
-    receiver: mpsc::Receiver<FrameData>,
+    receiver: Option<mpsc::Receiver<FrameData>>,
 }
 
 #[no_mangle]
@@ -207,9 +204,6 @@ impl VideoThread {
             let mut frame_count = 0u64;
 
             while running.load(atomic::Ordering::Relaxed) || frame.waiting.load(atomic::Ordering::Relaxed) {
-                if !frame.waiting.load(atomic::Ordering::Relaxed) {
-                    thread::park();
-                }
                 if WlrFrame::handle_output(&frame, &screencopy_manager, &output) {
                     frame_count = frame_count + 1;
                 }
@@ -231,8 +225,13 @@ impl VideoThread {
         VideoThread {
             thread: Some(t),
             running: running_ret,
-            receiver: receiver,
+            receiver: Some(receiver),
         }
+    }
+
+    #[inline(always)]
+    fn receiver_mut(&mut self) -> &mut mpsc::Receiver<FrameData> {
+        self.receiver.as_mut().unwrap()
     }
 }
 
@@ -241,7 +240,7 @@ impl Drop for VideoThread {
         println!("obs_wlroots: VideoThread::drop");
         if let Some(t) = self.thread.take() {
             self.running.store(false, atomic::Ordering::Relaxed);
-            t.thread().unpark();
+            mem::drop(self.receiver.take());
             t.join().unwrap();
         }
     }
