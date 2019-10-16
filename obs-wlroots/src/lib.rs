@@ -4,9 +4,7 @@ extern crate wayland_client;
 
 pub use obs::sys as obs_sys;
 
-use std::ptr;
-
-static mut MODULE_PTR: *mut obs_sys::obs_module = ptr::null_mut();
+use obs::obs_declare_module;
 
 static mut SOURCE_INFO: Option<obs::source::SourceInfo> = None;
 
@@ -28,15 +26,7 @@ pub extern "C" fn obs_module_unload() {
     println!("libobs_wlroots unloaded");
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn obs_module_set_pointer(module: *mut obs_sys::obs_module) {
-    MODULE_PTR = module;
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn obs_current_module() -> *mut obs_sys::obs_module {
-    MODULE_PTR
-}
+obs_declare_module! {obs_module}
 
 #[no_mangle]
 pub extern "C" fn obs_module_ver() -> u32 {

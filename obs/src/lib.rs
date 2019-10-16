@@ -12,6 +12,27 @@ pub mod gs;
 
 pub use properties::Properties;
 
+#[macro_export]
+macro_rules! obs_declare_module {
+    ($module_name:ident) => {
+        pub mod $module_name {
+            use std::ptr;
+
+            static mut MODULE_PTR: *mut obs::sys::obs_module = ptr::null_mut();
+
+            #[no_mangle]
+            pub unsafe extern "C" fn obs_module_set_pointer(module: *mut obs::sys::obs_module) {
+                MODULE_PTR = module;
+            }
+
+            #[no_mangle]
+            pub unsafe extern "C" fn obs_current_module() -> *mut obs::sys::obs_module {
+                MODULE_PTR
+            }
+        }
+    };
+}
+
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub struct SemanticVersion(u32);
 
