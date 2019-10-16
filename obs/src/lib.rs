@@ -42,14 +42,17 @@ impl SemanticVersion {
         SemanticVersion(v)
     }
 
+    #[inline(always)]
     pub fn major(&self) -> u8 {
         (self.0 >> 24) as u8
     }
 
+    #[inline(always)]
     pub fn minor(&self) -> u8 {
         (self.0 >> 16) as u8
     }
 
+    #[inline(always)]
     pub fn patch(&self) -> u8 {
         self.0 as u8
     }
@@ -67,12 +70,4 @@ pub const fn libobs_api_ver() -> SemanticVersion {
         sys::LIBOBS_API_MINOR_VER as u8,
         sys::LIBOBS_API_PATCH_VER as u8
     )
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn it_works() {
-        assert_eq!(2 + 2, 4);
-    }
 }
