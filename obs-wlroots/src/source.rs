@@ -28,7 +28,7 @@ use wayland_protocols::unstable::xdg_output::v1::client::zxdg_output_manager_v1:
 use wayland_protocols::unstable::xdg_output::v1::client::zxdg_output_v1;
 use wayland_protocols::wlr::unstable::screencopy::v1::client::zwlr_screencopy_frame_v1::{self, ZwlrScreencopyFrameV1};
 use wayland_protocols::wlr::unstable::screencopy::v1::client::zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1;
-use crate::shm::{self, ShmFd};
+use crate::shm::ShmFd;
 use crate::mmap::MappedMemory;
 
 pub struct WlrSource {
@@ -124,7 +124,7 @@ impl obs::source::Source for WlrSource {
             })
             .map(|output| output.handle.clone());
         mem::drop(self.video_thread.take());
-        self.video_thread = current_output.map(|handle| VideoThread::new(handle, self.source_handle, self.display.clone(), time::Duration::from_millis(5)));
+        self.video_thread = current_output.map(|handle| VideoThread::new(handle, self.source_handle, self.display.clone()));
     }
 
     fn get_properties(&mut self) -> obs::Properties {
@@ -184,7 +184,7 @@ fn obs_wlroots_create_event_queue(display: &Display) -> EventQueue {
 }
 
 impl VideoThread {
-    fn new(output: WlOutput, source_handle: obs::source::SourceHandle, display: Arc<Display>, sleep_duration: time::Duration) -> VideoThread {
+    fn new(output: WlOutput, source_handle: obs::source::SourceHandle, display: Arc<Display>) -> VideoThread {
         let running = Arc::new(AtomicBool::new(true));
         let running_ret = running.clone();
         let builder = thread::Builder::new()
@@ -220,7 +220,6 @@ impl VideoThread {
                     start = time::Instant::now();
                     frame_count = 0;
                 }
-                // thread::sleep(sleep_duration);
             }
             events.sync_roundtrip(|_, _| {})
                 .expect("Error waiting on disply events");
@@ -370,7 +369,6 @@ impl WlrFrame {
                 frame.copy(&buffer.as_ref().unwrap().buffer);
             },
             Event::Ready { .. } => {
-                use std::ptr;
                 let buffer = self.buffer.lock().unwrap();
                 let buffer = buffer.as_ref().unwrap();
                 let buf = unsafe {
@@ -378,29 +376,10 @@ impl WlrFrame {
                         .unwrap()
                 };
                 let meta = self.metadata.get();
-                let mut source_frame = obs_sys::obs_source_frame {
-                    data: [ptr::null_mut(); 8],
-                    linesize: [0; 8],
-                    width: meta.width,
-                    height: meta.height,
-                    format: obs_sys::video_format::VIDEO_FORMAT_BGRA,
-                    flip: true,
-
-                    timestamp: 0,
-                    color_matrix: [0f32; 16],
-                    full_range: false,
-                    color_range_min: [0f32; 3],
-                    color_range_max: [0f32; 3],
-                    refs: 0,
-                    prev_frame: false
-                };
-                source_frame.data[0] = unsafe { mem::transmute(buf.as_raw()) };
-                source_frame.linesize[0] = meta.stride;
-
                 // unsafe {
                 //     obs_sys::obs_source_output_video(self.source_handle.as_raw(), &source_frame);
                 // }
-                self.sender.send(FrameData(buf, source_frame)).unwrap();
+                self.sender.send(unsafe { FrameData::new(buf, &meta) }).unwrap();
 
                 self.waiting.store(false, atomic::Ordering::Relaxed);
                 frame.destroy();
@@ -466,5 +445,30 @@ impl WlrOutput {
 }
 
 struct FrameData(MappedMemory, obs_sys::obs_source_frame);
+
+impl FrameData {
+    unsafe fn new(buf: MappedMemory, meta: &FrameMetadata) -> FrameData {
+        use std::ptr;
+        let mut source_frame = obs_sys::obs_source_frame {
+            data: [ptr::null_mut(); 8],
+            linesize: [0; 8],
+            width: meta.width,
+            height: meta.height,
+            format: obs_sys::video_format::VIDEO_FORMAT_BGRA, // TODO: don't hard-code this
+            flip: true,
+
+            timestamp: 0,
+            color_matrix: [0f32; 16],
+            full_range: false,
+            color_range_min: [0f32; 3],
+            color_range_max: [0f32; 3],
+            refs: 0,
+            prev_frame: false
+        };
+        source_frame.data[0] = mem::transmute(buf.as_raw());
+        source_frame.linesize[0] = meta.stride;
+        FrameData(buf, source_frame)
+    }
+}
 
 unsafe impl Send for FrameData {}
