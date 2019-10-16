@@ -1,5 +1,6 @@
 use ::obs_sys as sys;
 use crate::properties;
+use crate::gs;
 use std::ffi;
 use std::mem;
 use std::ptr;
@@ -174,4 +175,10 @@ pub fn async_video_source_info<S: AsyncVideoSource>() -> SourceInfo {
     info.update = Some(update::<S>);
     info.get_properties = Some(get_properties::<S>);
     SourceInfo(info)
+}
+
+pub fn obs_source_draw(texture: &mut gs::Texture, x: libc::c_int, y: libc::c_int, cx: u32, cy: u32, flip: bool) {
+    unsafe {
+        obs_sys::obs_source_draw(texture.as_raw(), x, y, cx, cy, flip);
+    }
 }

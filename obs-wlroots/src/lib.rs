@@ -17,7 +17,7 @@ pub(crate) mod mmap;
 #[no_mangle]
 pub extern "C" fn obs_module_load() -> bool {
     unsafe {
-        SOURCE_INFO = Some(obs::source::async_video_source_info::<source::WlrSource>());
+        SOURCE_INFO = Some(obs::source::video_source_info::<source::WlrSource>());
         obs::source::register_source(SOURCE_INFO.as_ref().unwrap().as_raw());
     }
     println!("libobs_wlroots loaded");

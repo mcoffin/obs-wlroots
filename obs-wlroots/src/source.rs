@@ -4,7 +4,8 @@ use std::mem;
 use std::sync::{
     Arc,
     RwLock,
-    Mutex
+    Mutex,
+    mpsc,
 };
 use std::sync::atomic::{self, AtomicBool};
 use std::thread;
@@ -28,6 +29,7 @@ use wayland_protocols::unstable::xdg_output::v1::client::zxdg_output_v1;
 use wayland_protocols::wlr::unstable::screencopy::v1::client::zwlr_screencopy_frame_v1::{self, ZwlrScreencopyFrameV1};
 use wayland_protocols::wlr::unstable::screencopy::v1::client::zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1;
 use crate::shm::{self, ShmFd};
+use crate::mmap::MappedMemory;
 
 pub struct WlrSource {
     display: Arc<Display>,
@@ -37,6 +39,8 @@ pub struct WlrSource {
     output_manager: Main<ZxdgOutputManagerV1>,
     video_thread: Option<VideoThread>,
     source_handle: obs::source::SourceHandle,
+    last_width: u32,
+    last_height: u32,
 }
 
 impl WlrSource {
@@ -101,6 +105,8 @@ impl obs::source::Source for WlrSource {
             outputs: BTreeMap::new(),
             video_thread: None,
             source_handle: obs::source::SourceHandle::new(source as *mut obs_sys::obs_source_t),
+            last_width: 0,
+            last_height: 0,
         };
         ret.update_xdg();
         ret.update(settings);
@@ -137,11 +143,33 @@ impl obs::source::Source for WlrSource {
     }
 }
 
-impl obs::source::AsyncVideoSource for WlrSource {}
+impl obs::source::VideoSource for WlrSource {
+    fn width(&self) -> u32 {
+        self.last_width
+    }
+
+    fn height(&self) -> u32 {
+        self.last_height
+    }
+
+    fn render(&mut self) {
+        if let Some(video_thread) = self.video_thread.as_mut() {
+            let unparked = video_thread.thread.as_ref().map(|t| t.thread().unpark());
+            if unparked.is_some() {
+                let FrameData(_mem, mut source_frame) = video_thread.receiver.recv().unwrap();
+                self.last_width = source_frame.width;
+                self.last_height = source_frame.height;
+                let mut texture = obs::gs::Texture::from(&mut source_frame);
+                obs::source::obs_source_draw(&mut texture, 0, 0, 0, 0, source_frame.flip);
+            }
+        }
+    }
+}
 
 pub struct VideoThread {
     thread: Option<thread::JoinHandle<()>>,
     running: Arc<AtomicBool>,
+    receiver: mpsc::Receiver<FrameData>,
 }
 
 #[no_mangle]
@@ -161,6 +189,7 @@ impl VideoThread {
         let running_ret = running.clone();
         let builder = thread::Builder::new()
             .name("obs-wlroots".into());
+        let (sender, receiver) = mpsc::sync_channel(1);
         let t = builder.spawn(move || {
             let mut events = obs_wlroots_create_event_queue(display.as_ref());
             let video_display = (**display).clone().attach(events.get_token());
@@ -173,10 +202,14 @@ impl VideoThread {
                 .expect(&format!("Error instantiating {}", <WlShm as Interface>::NAME));
             events.sync_roundtrip(|_, _| {})
                 .expect("Error waiting on display events");
-            let frame = WlrFrame::new((*shm).clone(), source_handle);
+            let frame = WlrFrame::new((*shm).clone(), source_handle, sender);
             let mut start = time::Instant::now();
             let mut frame_count = 0u64;
+
             while running.load(atomic::Ordering::Relaxed) || frame.waiting.load(atomic::Ordering::Relaxed) {
+                if !frame.waiting.load(atomic::Ordering::Relaxed) {
+                    thread::park();
+                }
                 if WlrFrame::handle_output(&frame, &screencopy_manager, &output) {
                     frame_count = frame_count + 1;
                 }
@@ -187,7 +220,7 @@ impl VideoThread {
                     start = time::Instant::now();
                     frame_count = 0;
                 }
-                thread::sleep(sleep_duration);
+                // thread::sleep(sleep_duration);
             }
             events.sync_roundtrip(|_, _| {})
                 .expect("Error waiting on disply events");
@@ -199,6 +232,7 @@ impl VideoThread {
         VideoThread {
             thread: Some(t),
             running: running_ret,
+            receiver: receiver,
         }
     }
 }
@@ -208,6 +242,7 @@ impl Drop for VideoThread {
         println!("obs_wlroots: VideoThread::drop");
         if let Some(t) = self.thread.take() {
             self.running.store(false, atomic::Ordering::Relaxed);
+            t.thread().unpark();
             t.join().unwrap();
         }
     }
@@ -291,6 +326,7 @@ impl Default for FrameMetadata {
 }
 
 struct WlrFrame {
+    sender: mpsc::SyncSender<FrameData>,
     metadata: Cell<FrameMetadata>,
     buffer: Mutex<Option<WlrBuffer>>,
     shm: Attached<WlShm>,
@@ -299,8 +335,9 @@ struct WlrFrame {
 }
 
 impl WlrFrame {
-    pub fn new(shm: Attached<WlShm>, source_handle: obs::source::SourceHandle) -> Arc<WlrFrame> {
+    pub fn new(shm: Attached<WlShm>, source_handle: obs::source::SourceHandle, sender: mpsc::SyncSender<FrameData>) -> Arc<WlrFrame> {
         Arc::new(WlrFrame {
+            sender: sender,
             metadata: Cell::new(FrameMetadata::default()),
             buffer: Mutex::new(None),
             shm: shm,
@@ -334,7 +371,6 @@ impl WlrFrame {
             },
             Event::Ready { .. } => {
                 use std::ptr;
-                use crate::mmap::MappedMemory;
                 let buffer = self.buffer.lock().unwrap();
                 let buffer = buffer.as_ref().unwrap();
                 let buf = unsafe {
@@ -361,9 +397,10 @@ impl WlrFrame {
                 source_frame.data[0] = unsafe { mem::transmute(buf.as_raw()) };
                 source_frame.linesize[0] = meta.stride;
 
-                unsafe {
-                    obs_sys::obs_source_output_video(self.source_handle.as_raw(), &source_frame);
-                }
+                // unsafe {
+                //     obs_sys::obs_source_output_video(self.source_handle.as_raw(), &source_frame);
+                // }
+                self.sender.send(FrameData(buf, source_frame)).unwrap();
 
                 self.waiting.store(false, atomic::Ordering::Relaxed);
                 frame.destroy();
@@ -427,3 +464,7 @@ impl WlrOutput {
             .unwrap_or("<unknown>")
     }
 }
+
+struct FrameData(MappedMemory, obs_sys::obs_source_frame);
+
+unsafe impl Send for FrameData {}
