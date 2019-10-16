@@ -11,7 +11,7 @@ static mut MODULE_PTR: *mut obs_sys::obs_module = ptr::null_mut();
 static mut SOURCE_INFO: Option<obs::source::SourceInfo> = None;
 
 pub mod source;
-pub(crate) mod shm;
+pub mod shm;
 pub(crate) mod mmap;
 
 #[no_mangle]

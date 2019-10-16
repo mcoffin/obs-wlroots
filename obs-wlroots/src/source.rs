@@ -117,6 +117,7 @@ impl obs::source::Source for WlrSource {
                 output.name() == settings.get_str("output").unwrap_or(Cow::Borrowed(""))
             })
             .map(|output| output.handle.clone());
+        mem::drop(self.video_thread.take());
         self.video_thread = current_output.map(|handle| VideoThread::new(handle, self.source_handle, self.display.clone(), time::Duration::from_millis(5)));
     }
 
@@ -143,12 +144,25 @@ pub struct VideoThread {
     running: Arc<AtomicBool>,
 }
 
+#[no_mangle]
+fn obs_wlroots_video_thread_done(frame: &WlrFrame) {
+    println!("obs_wlroots: VideoThread: frame status = {}", frame.waiting.load(atomic::Ordering::Relaxed));
+    println!("obs_wlroots: VideoThread: done");
+}
+
+#[no_mangle]
+fn obs_wlroots_create_event_queue(display: &Display) -> EventQueue {
+    display.create_event_queue()
+}
+
 impl VideoThread {
     fn new(output: WlOutput, source_handle: obs::source::SourceHandle, display: Arc<Display>, sleep_duration: time::Duration) -> VideoThread {
         let running = Arc::new(AtomicBool::new(true));
         let running_ret = running.clone();
-        let t = thread::spawn(move || {
-            let mut events = display.create_event_queue();
+        let builder = thread::Builder::new()
+            .name("obs-wlroots".into());
+        let t = builder.spawn(move || {
+            let mut events = obs_wlroots_create_event_queue(display.as_ref());
             let video_display = (**display).clone().attach(events.get_token());
             let global_manager = GlobalManager::new(&video_display);
             events.sync_roundtrip(|_, _| {})
@@ -162,8 +176,7 @@ impl VideoThread {
             let frame = WlrFrame::new((*shm).clone(), source_handle);
             let mut start = time::Instant::now();
             let mut frame_count = 0u64;
-            while running.load(atomic::Ordering::Relaxed) {
-
+            while running.load(atomic::Ordering::Relaxed) || frame.waiting.load(atomic::Ordering::Relaxed) {
                 if WlrFrame::handle_output(&frame, &screencopy_manager, &output) {
                     frame_count = frame_count + 1;
                 }
@@ -176,8 +189,13 @@ impl VideoThread {
                 }
                 thread::sleep(sleep_duration);
             }
-            println!("obs_wlroots: VideoThread: done");
-        });
+            events.sync_roundtrip(|_, _| {})
+                .expect("Error waiting on disply events");
+            obs_wlroots_video_thread_done(&frame);
+            mem::drop(frame);
+            mem::drop(events);
+            mem::drop(running);
+        }).unwrap();
         VideoThread {
             thread: Some(t),
             running: running_ret,
@@ -187,6 +205,7 @@ impl VideoThread {
 
 impl Drop for VideoThread {
     fn drop(&mut self) {
+        println!("obs_wlroots: VideoThread::drop");
         if let Some(t) = self.thread.take() {
             self.running.store(false, atomic::Ordering::Relaxed);
             t.join().unwrap();
@@ -206,11 +225,11 @@ struct WlrBuffer {
 impl WlrBuffer {
     fn new(shm: &Attached<WlShm>, frame: &WlrFrame) -> WlrBuffer {
         let size = frame.size();
-        let fd = ShmFd::open(WLR_FRAME_SHM_PATH, libc::O_CREAT | libc::O_RDWR, 0).unwrap();
-        unsafe {
-            shm::unlink(WLR_FRAME_SHM_PATH);
-            libc::ftruncate(fd.as_raw(), size as libc::off_t);
-        }
+        let mut fd = ShmFd::open(WLR_FRAME_SHM_PATH, libc::O_CREAT | libc::O_RDWR, 0).unwrap();
+        fd.unlink()
+            .expect("error unlinking ShmFd");
+        fd.truncate(size as libc::off_t)
+            .expect("error truncating ShmFd");
         let pool  = shm.create_pool(fd.as_raw(), size as i32);
         let frame_meta = frame.metadata.get();
         let buffer = pool.create_buffer(0, frame_meta.width as i32, frame_meta.height as i32, frame_meta.stride as i32, frame.buffer_format().unwrap());
@@ -230,6 +249,7 @@ impl WlrBuffer {
 
 impl Drop for WlrBuffer {
     fn drop(&mut self) {
+        println!("obs_wlroots: WlrBuffer::drop");
         self.buffer.destroy();
         self.pool.destroy();
     }
@@ -307,7 +327,7 @@ impl WlrFrame {
                 let mut buffer = self.buffer.lock().unwrap();
                 let buffer_size = buffer.as_ref().map(WlrBuffer::size);
                 if buffer_size.is_none() || buffer_size != Some(self.size()) {
-                    println!("obs_wlroots: re-creating buffer");
+                    println!("obs_wlroots: re-creating buffer: had_previous = {}", !buffer_size.is_none());
                     *buffer = Some(WlrBuffer::new(&self.shm, self));
                 }
                 frame.copy(&buffer.as_ref().unwrap().buffer);
@@ -364,6 +384,12 @@ impl WlrFrame {
     #[inline(always)]
     fn buffer_format(&self) -> Option<wl_shm::Format> {
         wl_shm::Format::from_raw(self.metadata.get().format)
+    }
+}
+
+impl Drop for WlrFrame {
+    fn drop(&mut self) {
+        println!("obs_wlroots: WlrFrame::drop");
     }
 }
 
