@@ -38,6 +38,7 @@ pub struct WlrSource {
     output_running: Arc<AtomicBool>,
     update_thread: Option<thread::JoinHandle<()>>,
     update_sender: mpsc::SyncSender<Option<obs::data::Data>>,
+    update_running: Arc<AtomicBool>,
     video_receiver: Option<mpsc::Receiver<FrameData>>,
     should_render: Arc<AtomicBool>,
     last_width: u32,
@@ -49,8 +50,12 @@ impl Drop for WlrSource {
         println!("obs_wlroots: WlrSource::drop");
         self.output_running.store(false, atomic::Ordering::Relaxed);
         self.output_thread.take().map(|t| t.join());
+        println!("obs_wlroots: WlrSource::drop: done with output thread!");
+        self.update_running.store(false, atomic::Ordering::Relaxed);
+        self.update_sender.send(None).unwrap();
         mem::drop(self.video_receiver.take());
         self.update_thread.take().map(|t| t.join());
+        println!("obs_wlroots: WlrSource::drop: done with update thread!");
     }
 }
 
@@ -74,12 +79,14 @@ impl obs::source::Source for WlrSource {
         let source_handle = obs::source::SourceHandle::new(source as *mut obs_sys::obs_source_t);
         let (video_sender, video_receiver) = mpsc::sync_channel(1);
         let should_render = Arc::new(AtomicBool::new(false));
+        let update_running = Arc::new(AtomicBool::new(true));
         let update_thread = {
             let display = display.clone();
             let xdg_outputs = xdg_outputs.clone();
             let should_render = should_render.clone();
             let builder = thread::Builder::new()
                 .name("obs-wlroots:update".into());
+            let update_running = update_running.clone();
             builder.spawn(move || {
                 use std::borrow::Cow;
 
@@ -87,6 +94,9 @@ impl obs::source::Source for WlrSource {
                 let mut video_thread: Option<VideoThread> = None;
                 let mut last_settings: Option<obs::data::Data> = None;
                 while let Ok(settings) = update_receiver.recv() {
+                    if !update_running.load(atomic::Ordering::Relaxed) {
+                        break;
+                    }
                     println!("obs_wlroots: update");
                     if settings.is_some() {
                         last_settings = settings;
@@ -104,6 +114,7 @@ impl obs::source::Source for WlrSource {
                     }
                     should_render.store(video_thread.is_some(), atomic::Ordering::Relaxed);
                 }
+                println!("obs_wlroots: update_thread done! (dropping VideoThread)");
                 mem::drop(video_thread.take());
             }).unwrap()
         };
@@ -172,6 +183,7 @@ impl obs::source::Source for WlrSource {
                         .map(|_| {})
                         .unwrap_or_else(|_| output_running.store(false, atomic::Ordering::Relaxed));
                 }
+                println!("obs_wlroots: output_thread done!");
             }).unwrap()
         };
         thread::park();
@@ -182,6 +194,7 @@ impl obs::source::Source for WlrSource {
             output_running: output_running,
             update_thread: Some(update_thread),
             update_sender: update_sender,
+            update_running: update_running,
             video_receiver: Some(video_receiver),
             should_render: should_render,
             last_width: 0,
@@ -276,7 +289,7 @@ impl VideoThread {
             let mut frame_count = 0u64;
 
             while running.load(atomic::Ordering::Relaxed) || frame.waiting.load(atomic::Ordering::Relaxed) {
-                if WlrFrame::handle_output(&frame, &screencopy_manager, &output) {
+                if WlrFrame::handle_output(&frame, &screencopy_manager, &output, &running) {
                     frame_count = frame_count + 1;
                 }
                 events.sync_roundtrip(|_, _| {})
@@ -409,17 +422,18 @@ impl WlrFrame {
         })
     }
 
-    pub fn handle_output(s: &Arc<WlrFrame>, screencopy_manager: &ZwlrScreencopyManagerV1, output: &WlOutput) -> bool {
+    pub fn handle_output(s: &Arc<WlrFrame>, screencopy_manager: &ZwlrScreencopyManagerV1, output: &WlOutput, running: &Arc<AtomicBool>) -> bool {
         if !s.waiting.compare_and_swap(false, true, atomic::Ordering::AcqRel) {
             let handler = s.clone();
+            let running = running.clone();
             let frame = screencopy_manager.capture_output(1, output);
-            frame.assign_mono(move |obj, evt| handler.handle_frame_event(&obj, evt));
+            frame.assign_mono(move |obj, evt| handler.handle_frame_event(&obj, evt, running.clone()));
             return true;
         }
         false
     }
 
-    fn handle_frame_event(&self, frame: &ZwlrScreencopyFrameV1, event: zwlr_screencopy_frame_v1::Event) {
+    fn handle_frame_event(&self, frame: &ZwlrScreencopyFrameV1, event: zwlr_screencopy_frame_v1::Event, running: Arc<AtomicBool>) {
         use zwlr_screencopy_frame_v1::Event;
         match event {
             Event::Buffer { format, width, height, stride } => {
@@ -443,7 +457,11 @@ impl WlrFrame {
                 // unsafe {
                 //     obs_sys::obs_source_output_video(self.source_handle.as_raw(), &source_frame);
                 // }
-                self.sender.send(unsafe { FrameData::new(buf, &meta) }).unwrap();
+                self.sender.send(unsafe { FrameData::new(buf, &meta) })
+                    .unwrap_or_else(|_| {
+                        println!("obs_wlroots: obs is probably shutting down.");
+                        running.store(false, atomic::Ordering::Relaxed);
+                    });
 
                 self.waiting.store(false, atomic::Ordering::Relaxed);
                 frame.destroy();
