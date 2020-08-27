@@ -12,8 +12,5 @@ mkpd() {
 }
 
 mkpd ~/.config/obs-studio/plugins/$plugin_name/bin/64bit
-if [ -e libobs_wlroots.so ]; then
-	rm libobs_wlroots.so
-fi
-ln -s $target_dir/$build_type/libobs_wlroots.so libobs_wlroots.so
+ln -s -f $target_dir/$build_type/libobs_wlroots.so libobs_wlroots.so
 popd
