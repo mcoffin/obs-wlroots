@@ -1,9 +1,15 @@
 use ::obs_sys as sys;
 use crate::properties;
 use crate::gs;
-use std::ffi;
-use std::mem;
-use std::ptr;
+use std::{
+    ffi,
+    mem,
+    ptr,
+    io::{
+        self,
+        Write,
+    },
+};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct SourceHandle(*mut sys::obs_source_t);
@@ -69,6 +75,18 @@ fn empty_source(t: sys::obs_source_type) -> sys::obs_source_info {
         get_defaults2: None,
         get_properties2: None,
         audio_mix: None,
+        icon_type: sys::obs_icon_type::OBS_ICON_TYPE_DESKTOP_CAPTURE,
+        media_play_pause: None,
+        media_restart: None,
+        media_stop: None,
+        media_next: None,
+        media_previous: None,
+        media_get_duration: None,
+        media_get_time: None,
+        media_set_time: None,
+        media_get_state: None,
+        version: 0,
+        unversioned_id: ptr::null(),
     }
 }
 
@@ -92,10 +110,16 @@ unsafe extern "C" fn get_name<S: Source>(_data: *mut ffi::c_void) -> *const i8 {
 unsafe extern "C" fn create<S: Source>(settings: *mut sys::obs_data_t, source: *mut sys::obs_source_t) -> *mut ffi::c_void {
     let settings: &mut sys::obs_data_t = settings.as_mut().unwrap();
     let source: &mut sys::obs_source_t = source.as_mut().unwrap();
-    let ret: S = S::create(settings, source)
-        .expect("Error creating source");
-    let ret = Box::new(ret);
-    mem::transmute(Box::into_raw(ret))
+    let ret: Result<S, _> = S::create(settings, source);
+    if let Err(e) = ret.as_ref() {
+        let stderr = io::stderr();
+        let mut stderr = stderr.lock();
+        let _result = writeln!(&mut stderr, "error: error creaiting source: {}", e);
+        ptr::null_mut()
+    } else {
+        let ret = Box::new(ret);
+        mem::transmute(Box::into_raw(ret))
+    }
 }
 
 unsafe extern "C" fn destroy<S: Source>(data: *mut ffi::c_void) {
