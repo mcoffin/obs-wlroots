@@ -329,7 +329,7 @@ struct WlrFrame {
     buffer: Mutex<Option<WlrBuffer>>,
     shm: Attached<WlShm>,
     waiting: AtomicBool,
-    source_handle: obs::source::SourceHandle,
+    _source_handle: obs::source::SourceHandle,
 }
 
 impl WlrFrame {
@@ -340,7 +340,7 @@ impl WlrFrame {
             buffer: Mutex::new(None),
             shm: shm,
             waiting: AtomicBool::new(false),
-            source_handle: source_handle
+            _source_handle: source_handle
         })
     }
 
